@@ -1,7 +1,9 @@
 import asyncio
 import logging
 import os
-from datetime import time as dt_time
+import json
+import time
+from datetime import datetime, time as dt_time
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, Optional
 
@@ -15,8 +17,9 @@ from telegram.ext import (
     Defaults,
 )
 
+from src.history import load_history, history_count
 from src.formatting import album_message, album_url
-from src.library import get_albums_with_cache
+from src.library import get_albums_with_cache, load_cache_payload
 from src.picker import pick_random_album_no_repeat
 
 
@@ -27,19 +30,29 @@ CB_REFRESH = "REFRESH_LIBRARY"
 CB_STATUS = "STATUS"
 
 
-def build_keyboard() -> InlineKeyboardMarkup:
+def build_keyboard(open_url: Optional[str]) -> InlineKeyboardMarkup:
     # Buttons trigger callback queries handled by CallbackQueryHandler.
-    keyboard = [
-        [
-            InlineKeyboardButton("🎲 Another album", callback_data=CB_NEXT),
-            InlineKeyboardButton("🔄 Refresh library", callback_data=CB_REFRESH),
-        ],
-        [
-            InlineKeyboardButton("📊 Status", callback_data=CB_STATUS),
-        ],
+    row1 = [
+        InlineKeyboardButton("🎲 Another album", callback_data=CB_NEXT),
+        InlineKeyboardButton("🔄 Refresh library", callback_data=CB_REFRESH),
     ]
-    return InlineKeyboardMarkup(keyboard)
+    row2 = [InlineKeyboardButton("📊 Status", callback_data=CB_STATUS)]
 
+    rows = [row1, row2]
+
+    if open_url:
+        rows.insert(0, [InlineKeyboardButton("🔗 Open album", url=open_url)])
+
+    return InlineKeyboardMarkup(rows)
+
+def is_cooled_down(app: Application, min_seconds: float = 2.0) -> bool:
+    now = asyncio.get_event_loop().time()
+    state = app.bot_data["cooldown"]
+    last = float(state.get("last_ts", 0.0))
+    if now - last < min_seconds:
+        return False
+    state["last_ts"] = now
+    return True
 
 async def send_album(
     context: ContextTypes.DEFAULT_TYPE,
@@ -52,11 +65,11 @@ async def send_album(
     if prefix:
         text = f"{prefix}\n\n{text}"
 
-    # If we have a URL, Telegram will auto-link it; message also includes inline buttons.
+    url = album_url(album)
     await context.bot.send_message(
         chat_id=chat_id,
         text=text,
-        reply_markup=build_keyboard(),
+        reply_markup=build_keyboard(url),
         disable_web_page_preview=False,
     )
 
@@ -84,16 +97,31 @@ def is_allowed_chat(update: Update, allowed_chat_id: int) -> bool:
         return False
     return update.effective_chat.id == allowed_chat_id
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Log exceptions from handlers/jobs.
+    logging.exception("Unhandled exception in handler/job", exc_info=context.error)
+
+async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None) -> None:
+    # Reply either to a normal message (/command) or to a callback query (button press).
+    if update.message is not None:
+        await update.message.reply_text(text=text, reply_markup=reply_markup)
+        return
+
+    if update.callback_query is not None and update.callback_query.message is not None:
+        await update.callback_query.message.reply_text(text=text, reply_markup=reply_markup)
+        return
+
+    # Fallback: send directly to the allowed chat (should be rare).
+    allowed_chat_id = context.application.bot_data["allowed_chat_id"]
+    await context.bot.send_message(chat_id=allowed_chat_id, text=text, reply_markup=reply_markup)
+
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     allowed_chat_id = context.application.bot_data["allowed_chat_id"]
     if not is_allowed_chat(update, allowed_chat_id):
         return
 
-    await update.message.reply_text(
-        "Ready. Use /now to get an album, or wait for the daily post.",
-        reply_markup=build_keyboard(),
-    )
+    await reply(update, context, "Ready. Use /now to get an album, or wait for the daily post.", reply_markup=build_keyboard(None))
 
 
 async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -134,11 +162,13 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         limit=limit,
     )
 
-    await update.message.reply_text(
-        f"✅ Refreshed. Cached albums: {len(albums)}",
-        reply_markup=build_keyboard(),
-    )
+    await reply(update, context, f"✅ Refreshed. Cached albums: {len(albums)}", reply_markup=build_keyboard(None))
 
+def _fmt_ts(ts: Optional[int], tz: ZoneInfo) -> str:
+    if not ts:
+        return "n/a"
+    dt = datetime.fromtimestamp(int(ts), tz=tz)
+    return dt.strftime("%Y-%m-%d %H:%M:%S %Z")
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     allowed_chat_id = context.application.bot_data["allowed_chat_id"]
@@ -147,20 +177,28 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     cache_path = context.application.bot_data["cache_path"]
     history_path = context.application.bot_data["history_path"]
+    tz = context.application.bot_data["tz"]
 
-    # Keep it simple: report cache/history file presence and sizes.
-    cache_exists = os.path.exists(cache_path)
-    hist_exists = os.path.exists(history_path)
+    cache_payload = load_cache_payload(cache_path) or {}
+    albums = cache_payload.get("albums") or []
+    cache_updated = cache_payload.get("updated_at")
+
+    history = load_history(history_path)
+    sent_n = history_count(history)
+    hist_updated = history.get("updated_at")
+
+    total = len(albums)
+    remaining = max(total - sent_n, 0)
 
     msg_lines = [
-        f"Cache file: {'yes' if cache_exists else 'no'} ({cache_path})",
-        f"History file: {'yes' if hist_exists else 'no'} ({history_path})",
+        f"Cached albums: {total}",
+        f"Sent in current cycle: {sent_n}",
+        f"Remaining: {remaining}",
+        f"Cache updated: {_fmt_ts(cache_updated, tz)}",
+        f"History updated: {_fmt_ts(hist_updated, tz)}",
     ]
 
-    await update.message.reply_text(
-        "\n".join(msg_lines),
-        reply_markup=build_keyboard(),
-    )
+    await reply(update, context, "\n".join(msg_lines), reply_markup=build_keyboard(None))
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -176,12 +214,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     data = query.data
     if data == CB_NEXT:
+        if not is_cooled_down(context.application, 2.0):
+            await query.answer("Too fast 🙂", show_alert=False)
+            return
         # Reuse the /now logic.
         fake_update = update
         await cmd_now(fake_update, context)
         return
 
     if data == CB_REFRESH:
+        if not is_cooled_down(context.application, 2.0):
+            await query.answer("Too fast 🙂", show_alert=False)
+            return
         auth_path = context.application.bot_data["auth_path"]
         cache_path = context.application.bot_data["cache_path"]
         limit = context.application.bot_data["library_limit"]
@@ -195,7 +239,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         await query.message.reply_text(
             f"✅ Refreshed. Cached albums: {len(albums)}",
-            reply_markup=build_keyboard(),
+            reply_markup=build_keyboard(None),
         )
         return
 
@@ -259,12 +303,15 @@ def main() -> None:
     app.bot_data["cache_path"] = cache_path
     app.bot_data["history_path"] = history_path
     app.bot_data["library_limit"] = library_limit
+    app.bot_data["tz"] = tz
+    app.bot_data["cooldown"] = {"last_ts": 0.0}
 
     # Commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("now", cmd_now))
     app.add_handler(CommandHandler("refresh", cmd_refresh))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_error_handler(on_error)
 
     # Buttons (callback queries)
     app.add_handler(CallbackQueryHandler(on_callback))

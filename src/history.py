@@ -59,3 +59,7 @@ def mark_sent(history: History, browse_id: str) -> None:
     if browse_id not in current:
         current.append(browse_id)
     history["sent_browse_ids"] = current
+
+def history_count(history: History) -> int:
+    # Number of unique sent IDs stored in history.
+    return len(sent_set(history))

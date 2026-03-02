@@ -79,3 +79,10 @@ def get_albums_with_cache(
     albums = fetch_library_albums(auth_path=auth_path, limit=limit)
     save_cached_albums(cache_path, albums)
     return albums
+
+def load_cache_payload(cache_path: str) -> Optional[Dict[str, Any]]:
+    p = Path(cache_path)
+    if not p.exists():
+        return None
+    with p.open("r", encoding="utf-8") as f:
+        return json.load(f)
