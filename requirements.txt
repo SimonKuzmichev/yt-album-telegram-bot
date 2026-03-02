@@ -1,3 +1,4 @@
 python-dotenv==1.2.2
-python-telegram-bot[job-queue]==22.6
+python-telegram-bot[job-queue,socks]==22.6
 ytmusicapi==1.11.5
+requests[socks]==2.32.5
