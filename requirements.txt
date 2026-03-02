@@ -1,0 +1,3 @@
+python-dotenv==1.2.2
+python-telegram-bot==22.6
+ytmusicapi==1.11.5
