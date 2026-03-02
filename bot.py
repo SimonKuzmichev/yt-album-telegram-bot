@@ -6,6 +6,7 @@ import time
 from datetime import datetime, time as dt_time
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, Optional
+import traceback
 
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -21,6 +22,7 @@ from src.history import load_history, history_count
 from src.formatting import album_message, album_url
 from src.library import get_albums_with_cache, load_cache_payload
 from src.picker import pick_random_album_no_repeat
+from src.errors import is_auth_error, format_auth_help
 
 
 Album = Dict[str, Any]
@@ -101,6 +103,25 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Log exceptions from handlers/jobs.
     logging.exception("Unhandled exception in handler/job", exc_info=context.error)
 
+async def notify_error(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    title: str,
+    exc: Exception,
+) -> None:
+    """
+    Sends a user-friendly error message to Telegram and logs details.
+    """
+    logging.exception("%s: %s", title, exc)
+
+    # Keep the user message short; full traceback goes to logs.
+    msg = f"❌ {title}\n\n{exc}"
+
+    if is_auth_error(exc):
+        msg = f"{msg}\n\n{format_auth_help()}"
+
+    await context.bot.send_message(chat_id=chat_id, text=msg)
+
 async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None) -> None:
     # Reply either to a normal message (/command) or to a callback query (button press).
     if update.message is not None:
@@ -134,12 +155,16 @@ async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     history_path = context.application.bot_data["history_path"]
     limit = context.application.bot_data["library_limit"]
 
-    album, refreshed = pick_random_album_no_repeat(
-        auth_path=auth_path,
-        cache_path=cache_path,
-        history_path=history_path,
-        library_limit=limit,
-    )
+    try:
+        album, refreshed = pick_random_album_no_repeat(
+            auth_path=auth_path,
+            cache_path=cache_path,
+            history_path=history_path,
+            library_limit=limit,
+        )
+    except Exception as e:
+        await notify_error(context, allowed_chat_id, "Failed to pick an album", e)
+        return
 
     prefix = "🔄 Library refreshed (cycle restarted)" if refreshed else None
     await send_album(context, allowed_chat_id, album, prefix=prefix)
@@ -155,12 +180,16 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     limit = context.application.bot_data["library_limit"]
 
     # Force sync of the cached album list.
-    albums = get_albums_with_cache(
-        auth_path=auth_path,
-        cache_path=cache_path,
-        refresh=True,
-        limit=limit,
-    )
+    try:
+        albums = get_albums_with_cache(
+            auth_path=auth_path,
+            cache_path=cache_path,
+            refresh=True,
+            limit=limit,
+        )
+    except Exception as e:
+        await notify_error(context, allowed_chat_id, "Failed to refresh library cache", e)
+        return
 
     await reply(update, context, f"✅ Refreshed. Cached albums: {len(albums)}", reply_markup=build_keyboard(None))
 
@@ -229,13 +258,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         auth_path = context.application.bot_data["auth_path"]
         cache_path = context.application.bot_data["cache_path"]
         limit = context.application.bot_data["library_limit"]
-
-        albums = get_albums_with_cache(
-            auth_path=auth_path,
-            cache_path=cache_path,
-            refresh=True,
-            limit=limit,
-        )
+        
+        try:
+            albums = get_albums_with_cache(
+                auth_path=auth_path,
+                cache_path=cache_path,
+                refresh=True,
+                limit=limit,
+            )
+        except Exception as e:
+            await notify_error(context, allowed_chat_id, "Failed to refresh library cache", e)
+            return
 
         await query.message.reply_text(
             f"✅ Refreshed. Cached albums: {len(albums)}",
@@ -257,12 +290,16 @@ async def daily_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     history_path = context.application.bot_data["history_path"]
     limit = context.application.bot_data["library_limit"]
 
-    album, refreshed = pick_random_album_no_repeat(
-        auth_path=auth_path,
-        cache_path=cache_path,
-        history_path=history_path,
-        library_limit=limit,
-    )
+    try:
+        album, refreshed = pick_random_album_no_repeat(
+            auth_path=auth_path,
+            cache_path=cache_path,
+            history_path=history_path,
+            library_limit=limit,
+        )
+    except Exception as e:
+        await notify_error(context, allowed_chat_id, "Daily job failed (cannot pick album)", e)
+        return
 
     prefix = "🔄 Library refreshed (cycle restarted)" if refreshed else "📅 Daily album"
     await send_album(context, allowed_chat_id, album, prefix=prefix)
