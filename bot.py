@@ -362,6 +362,7 @@ def main() -> None:
         time=daily_time,
         days=(0, 1, 2, 3, 4, 5, 6),
         name="daily_album_job",
+        job_kwargs={"misfire_grace_time": 120, "coalesce": True, "max_instances": 1},
     )
 
     # Start polling (no public IP required)
