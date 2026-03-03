@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 from datetime import datetime, time as dt_time
+from time import perf_counter
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, Optional
@@ -44,6 +45,12 @@ def build_keyboard(open_url: Optional[str]) -> InlineKeyboardMarkup:
         rows.insert(0, [InlineKeyboardButton("🔗 Open album", url=open_url)])
 
     return InlineKeyboardMarkup(rows)
+
+def album_log_summary(album: Album) -> str:
+    title = str(album.get("title") or "").strip() or "n/a"
+    artist = str(album.get("artist") or "").strip() or "n/a"
+    browse_id = str(album.get("browseId") or "").strip() or "n/a"
+    return f"artist={artist!r} title={title!r} browseId={browse_id!r}"
 
 def is_cooled_down(app: Application, min_seconds: float = 2.0) -> bool:
     now = asyncio.get_event_loop().time()
@@ -94,8 +101,17 @@ def get_env_int(name: str) -> int:
 def is_allowed_chat(update: Update, allowed_chat_id: int) -> bool:
     # Only allow actions from a single chat_id (single-user bot).
     if update.effective_chat is None:
+        logging.warning("Rejected update without effective_chat")
         return False
-    return update.effective_chat.id == allowed_chat_id
+    is_allowed = update.effective_chat.id == allowed_chat_id
+    if not is_allowed:
+        uid = update.effective_user.id if update.effective_user else None
+        logging.warning(
+            "Rejected update from unauthorized chat_id=%s user_id=%s",
+            update.effective_chat.id,
+            uid,
+        )
+    return is_allowed
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Log exceptions from handlers/jobs.
@@ -145,6 +161,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed_chat(update, allowed_chat_id):
         return
 
+    user_id = update.effective_user.id if update.effective_user else None
+    logging.info("Command /start chat_id=%s user_id=%s", allowed_chat_id, user_id)
     await reply(update, context, "Ready. Use /now to get an album, or wait for the daily post.", reply_markup=build_keyboard(None))
 
 
@@ -153,11 +171,15 @@ async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed_chat(update, allowed_chat_id):
         return
 
+    user_id = update.effective_user.id if update.effective_user else None
+    logging.info("Command /now chat_id=%s user_id=%s", allowed_chat_id, user_id)
+
     auth_path = context.application.bot_data["auth_path"]
     cache_path = context.application.bot_data["cache_path"]
     history_path = context.application.bot_data["history_path"]
     limit = context.application.bot_data["library_limit"]
 
+    started_at = perf_counter()
     try:
         album, refreshed = pick_random_album_no_repeat(
             auth_path=auth_path,
@@ -169,6 +191,13 @@ async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await notify_error(context, allowed_chat_id, "Failed to pick an album", e)
         return
 
+    elapsed_ms = int((perf_counter() - started_at) * 1000)
+    logging.info(
+        "Album picked source=command refreshed=%s elapsed_ms=%s %s",
+        refreshed,
+        elapsed_ms,
+        album_log_summary(album),
+    )
     prefix = "🔄 Library refreshed (cycle restarted)" if refreshed else None
     await send_album(context, allowed_chat_id, album, prefix=prefix)
 
@@ -178,11 +207,15 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not is_allowed_chat(update, allowed_chat_id):
         return
 
+    user_id = update.effective_user.id if update.effective_user else None
+    logging.info("Command /refresh chat_id=%s user_id=%s", allowed_chat_id, user_id)
+
     auth_path = context.application.bot_data["auth_path"]
     cache_path = context.application.bot_data["cache_path"]
     limit = context.application.bot_data["library_limit"]
 
     # Force sync of the cached album list.
+    started_at = perf_counter()
     try:
         albums = get_albums_with_cache(
             auth_path=auth_path,
@@ -194,6 +227,10 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await notify_error(context, allowed_chat_id, "Failed to refresh library cache", e)
         return
 
+    elapsed_ms = int((perf_counter() - started_at) * 1000)
+    logging.info("Library refreshed source=command albums=%s elapsed_ms=%s", len(albums), elapsed_ms)
+    if not albums:
+        logging.warning("Library refresh returned empty album list source=command")
     await reply(update, context, f"✅ Refreshed. Cached albums: {len(albums)}", reply_markup=build_keyboard(None))
 
 def _fmt_ts(ts: Optional[int], tz: ZoneInfo) -> str:
@@ -206,6 +243,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     allowed_chat_id = context.application.bot_data["allowed_chat_id"]
     if not is_allowed_chat(update, allowed_chat_id):
         return
+
+    user_id = update.effective_user.id if update.effective_user else None
+    logging.info("Command /status chat_id=%s user_id=%s", allowed_chat_id, user_id)
 
     cache_path = context.application.bot_data["cache_path"]
     history_path = context.application.bot_data["history_path"]
@@ -221,6 +261,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     total = len(albums)
     remaining = max(total - sent_n, 0)
+    logging.info("Status snapshot cached_albums=%s sent=%s remaining=%s", total, sent_n, remaining)
+    if total == 0:
+        logging.warning("Status shows empty cached library")
 
     msg_lines = [
         f"Cached albums: {total}",
@@ -245,8 +288,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await query.answer()
 
     data = query.data
+    user_id = update.effective_user.id if update.effective_user else None
+    logging.info("Callback action=%s chat_id=%s user_id=%s", data, allowed_chat_id, user_id)
     if data == CB_NEXT:
         if not is_cooled_down(context.application, 2.0):
+            logging.info("Callback throttled action=%s chat_id=%s", data, allowed_chat_id)
             await query.answer("Too fast 🙂", show_alert=False)
             return
         # Reuse the /now logic.
@@ -256,12 +302,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if data == CB_REFRESH:
         if not is_cooled_down(context.application, 2.0):
+            logging.info("Callback throttled action=%s chat_id=%s", data, allowed_chat_id)
             await query.answer("Too fast 🙂", show_alert=False)
             return
         auth_path = context.application.bot_data["auth_path"]
         cache_path = context.application.bot_data["cache_path"]
         limit = context.application.bot_data["library_limit"]
         
+        started_at = perf_counter()
         try:
             albums = get_albums_with_cache(
                 auth_path=auth_path,
@@ -273,6 +321,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await notify_error(context, allowed_chat_id, "Failed to refresh library cache", e)
             return
 
+        elapsed_ms = int((perf_counter() - started_at) * 1000)
+        logging.info("Library refreshed source=callback albums=%s elapsed_ms=%s", len(albums), elapsed_ms)
+        if not albums:
+            logging.warning("Library refresh returned empty album list source=callback")
         await query.message.reply_text(
             f"✅ Refreshed. Cached albums: {len(albums)}",
             reply_markup=build_keyboard(None),
@@ -293,6 +345,8 @@ async def daily_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     history_path = context.application.bot_data["history_path"]
     limit = context.application.bot_data["library_limit"]
 
+    logging.info("Daily job started chat_id=%s", allowed_chat_id)
+    started_at = perf_counter()
     try:
         album, refreshed = pick_random_album_no_repeat(
             auth_path=auth_path,
@@ -304,8 +358,16 @@ async def daily_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         await notify_error(context, allowed_chat_id, "Daily job failed (cannot pick album)", e)
         return
 
+    elapsed_ms = int((perf_counter() - started_at) * 1000)
+    logging.info(
+        "Daily job picked album refreshed=%s elapsed_ms=%s %s",
+        refreshed,
+        elapsed_ms,
+        album_log_summary(album),
+    )
     prefix = "🔄 Library refreshed (cycle restarted)" if refreshed else "📅 Daily album"
     await send_album(context, allowed_chat_id, album, prefix=prefix)
+    logging.info("Daily job message sent chat_id=%s", allowed_chat_id)
 
 
 def main() -> None:
@@ -333,6 +395,15 @@ def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.info(
+        "Bot startup TZ=%s DAILY_TIME=%s LIBRARY_LIMIT=%s ALLOWED_CHAT_ID=%s",
+        tz_name,
+        daily_time_str,
+        library_limit,
+        allowed_chat_id,
     )
 
     app = Application.builder().token(token).defaults(Defaults(tzinfo=tz)).build()
