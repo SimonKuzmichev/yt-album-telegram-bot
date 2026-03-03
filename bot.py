@@ -1,12 +1,10 @@
 import asyncio
 import logging
 import os
-import json
-import time
 from datetime import datetime, time as dt_time
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, Optional
-import traceback
 
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -112,10 +110,15 @@ async def notify_error(
     """
     Sends a user-friendly error message to Telegram and logs details.
     """
-    logging.exception("%s: %s", title, exc)
+    error_id = uuid4().hex[:8]
+    logging.exception("%s [error_id=%s]: %s", title, error_id, exc)
 
-    # Keep the user message short; full traceback goes to logs.
-    msg = f"❌ {title}\n\n{exc}"
+    # Do not expose raw exception details in user-visible messages.
+    msg = (
+        f"❌ {title}\n\n"
+        "Internal error occurred. Check service logs for details.\n"
+        f"error_id: {error_id}"
+    )
 
     if is_auth_error(exc):
         msg = f"{msg}\n\n{format_auth_help()}"

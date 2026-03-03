@@ -31,7 +31,8 @@ def fetch_library_albums(
 ) -> List[Album]:
     """
     Fetch albums directly from the YT Music library.
-    limit=None returns as many items as the method provides (pagination may be needed later).
+    limit=None returns as many items as the method provides. 
+    TODO: pagination may be needed later
     """
     yt = YTMusic(auth_path)
     # ytmusicapi supports limit; None or a large value usually returns more results
