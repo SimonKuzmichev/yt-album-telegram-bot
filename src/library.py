@@ -20,6 +20,8 @@ def _normalize_album(raw: Dict[str, Any]) -> Album:
         "title": raw.get("title", "").strip(),
         "artist": artist.strip(),
         "year": raw.get("year"),
+        # ytmusicapi payload shape can vary by endpoint/version. Prefer browseId,
+        # then fallback IDs so downstream code still has a stable album identifier.
         "browseId": raw.get("browseId") or raw.get("audioPlaylistId") or raw.get("playlistId"),
         "thumbnails": raw.get("thumbnails") or [],
     }
@@ -74,6 +76,8 @@ def get_albums_with_cache(
     """
     if not refresh:
         cached = load_cached_albums(cache_path)
+        # Note: empty list is treated as cache miss and triggers a fresh fetch.
+        # This keeps behavior robust when cache file exists but contains no albums.
         if cached:
             return cached
 

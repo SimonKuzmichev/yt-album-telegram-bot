@@ -53,6 +53,9 @@ def album_log_summary(album: Album) -> str:
     return f"artist={artist!r} title={title!r} browseId={browse_id!r}"
 
 def is_cooled_down(app: Application, min_seconds: float = 2.0) -> bool:
+    # Global callback throttle: one shared timestamp in app.bot_data for the whole bot
+    # process (not per user/button). We use event-loop monotonic time to avoid issues
+    # from system clock jumps.
     now = asyncio.get_event_loop().time()
     state = app.bot_data["cooldown"]
     last = float(state.get("last_ts", 0.0))
@@ -285,6 +288,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if query is None:
         return
 
+    # Acknowledge callback immediately so Telegram stops showing the loading spinner.
+    # In throttled branches we answer again with a short toast for user feedback.
     await query.answer()
 
     data = query.data
@@ -433,6 +438,9 @@ def main() -> None:
         time=daily_time,
         days=(0, 1, 2, 3, 4, 5, 6),
         name="daily_album_job",
+        # misfire_grace_time: run late jobs if startup delay is <=120s.
+        # coalesce: merge missed runs into one execution after downtime.
+        # max_instances: prevent overlapping daily_job runs.
         job_kwargs={"misfire_grace_time": 120, "coalesce": True, "max_instances": 1},
     )
 

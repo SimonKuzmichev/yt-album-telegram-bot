@@ -48,6 +48,8 @@ def pick_random_album_no_repeat(
 
     if not unsent:
         # Step 4: everything is exhausted -> refresh (sync) library and restart cycle
+        # This is the normal cycle rollover path: we intentionally start from an
+        # empty history after a forced library sync.
         did_refresh = True
 
         albums = get_albums_with_cache(
