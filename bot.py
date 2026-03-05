@@ -396,9 +396,13 @@ def main() -> None:
     cache_path = os.getenv("ALBUM_CACHE_PATH", "data/albums_cache.json")
     history_path = os.getenv("HISTORY_PATH", "data/sent_history.json")
     library_limit = int(os.getenv("LIBRARY_LIMIT", "500"))
+    log_level_name = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+    log_level = getattr(logging, log_level_name, None)
+    if not isinstance(log_level, int):
+        raise RuntimeError(f"Invalid LOG_LEVEL: {log_level_name}")
 
     logging.basicConfig(
-        level=logging.INFO,
+        level=log_level,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
