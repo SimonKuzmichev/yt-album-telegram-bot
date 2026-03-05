@@ -39,6 +39,7 @@ def _upsert_user_tx(conn: psycopg.Connection, telegram_user_id: int, telegram_ch
             """,
             (telegram_user_id, telegram_chat_id),
         )
+        #TODO: check the return later
         row = cur.fetchone()
         if row is None:
             raise RuntimeError("Failed to upsert user")

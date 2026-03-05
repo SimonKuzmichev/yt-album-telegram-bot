@@ -22,6 +22,7 @@ from src.formatting import album_message, album_url
 from src.library import get_albums_with_cache, load_cache_payload
 from src.picker import pick_random_album_no_repeat
 from src.errors import is_auth_error, format_auth_help
+from src.db import upsert_user, ensure_user_settings
 
 
 Album = Dict[str, Any]
@@ -94,27 +95,83 @@ def parse_daily_time(value: str) -> dt_time:
     return dt_time(hour=hh, minute=mm)
 
 
-def get_env_int(name: str) -> int:
+def get_optional_env_int(name: str) -> Optional[int]:
     v = os.getenv(name)
     if v is None or not v.strip():
-        raise RuntimeError(f"{name} is not set")
+        return None
     return int(v)
 
 
-def is_allowed_chat(update: Update, allowed_chat_id: int) -> bool:
-    # Only allow actions from a single chat_id (single-user bot).
-    if update.effective_chat is None:
-        logging.warning("Rejected update without effective_chat")
-        return False
-    is_allowed = update.effective_chat.id == allowed_chat_id
-    if not is_allowed:
-        uid = update.effective_user.id if update.effective_user else None
-        logging.warning(
-            "Rejected update from unauthorized chat_id=%s user_id=%s",
-            update.effective_chat.id,
-            uid,
+def get_update_chat_id(update: Update) -> Optional[int]:
+    return update.effective_chat.id if update.effective_chat is not None else None
+
+
+def _is_admin_override_chat(update: Update, admin_chat_id_override: Optional[int]) -> bool:
+    chat_id = get_update_chat_id(update)
+    return admin_chat_id_override is not None and chat_id == admin_chat_id_override
+
+
+def register_user_from_update(update: Update) -> Optional[Dict[str, Any]]:
+    # Register/update Telegram identity in DB and ensure defaults in app.user_settings.
+    if update.effective_user is None or update.effective_chat is None:
+        logging.warning("Cannot register user: missing effective_user or effective_chat")
+        return None
+    user = upsert_user(
+        telegram_user_id=update.effective_user.id,
+        telegram_chat_id=update.effective_chat.id,
+    )
+    ensure_user_settings(user["id"])
+    return user
+
+
+async def require_allowlisted_user(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    action: str,
+) -> Optional[Dict[str, Any]]:
+    chat_id = get_update_chat_id(update)
+    user_id = update.effective_user.id if update.effective_user else None
+    admin_chat_id_override = context.application.bot_data["admin_chat_id_override"]
+
+    try:
+        user = register_user_from_update(update)
+    except Exception as e:
+        if chat_id is not None:
+            await notify_error(context, chat_id, f"Failed to register user for {action}", e)
+        logging.exception("DB registration failed action=%s chat_id=%s user_id=%s", action, chat_id, user_id)
+        return None
+
+    if user is None:
+        return None
+
+    if _is_admin_override_chat(update, admin_chat_id_override):
+        logging.info(
+            "Access granted via admin override action=%s chat_id=%s user_id=%s",
+            action,
+            chat_id,
+            user_id,
         )
-    return is_allowed
+        return user
+
+    if not bool(user.get("allowlisted")):
+        logging.info(
+            "Access denied (not allowlisted) action=%s chat_id=%s user_id=%s status=%s",
+            action,
+            chat_id,
+            user_id,
+            user.get("status"),
+        )
+        await reply(update, context, "Registered. Waiting for approval.")
+        return None
+
+    logging.info(
+        "Access granted action=%s chat_id=%s user_id=%s status=%s",
+        action,
+        chat_id,
+        user_id,
+        user.get("status"),
+    )
+    return user
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Log exceptions from handlers/jobs.
@@ -154,28 +211,48 @@ async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, r
         await update.callback_query.message.reply_text(text=text, reply_markup=reply_markup)
         return
 
-    # Fallback: send directly to the allowed chat (should be rare).
-    allowed_chat_id = context.application.bot_data["allowed_chat_id"]
-    await context.bot.send_message(chat_id=allowed_chat_id, text=text, reply_markup=reply_markup)
+    # Fallback: no route to reply.
+    logging.warning("Reply skipped: no message or callback message in update")
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    allowed_chat_id = context.application.bot_data["allowed_chat_id"]
-    if not is_allowed_chat(update, allowed_chat_id):
+    chat_id = get_update_chat_id(update)
+    user_id = update.effective_user.id if update.effective_user else None
+    if chat_id is None:
+        logging.warning("Command /start without effective_chat user_id=%s", user_id)
         return
 
-    user_id = update.effective_user.id if update.effective_user else None
-    logging.info("Command /start chat_id=%s user_id=%s", allowed_chat_id, user_id)
-    await reply(update, context, "Ready. Use /now to get an album, or wait for the daily post.", reply_markup=build_keyboard(None))
+    logging.info("Command /start chat_id=%s user_id=%s", chat_id, user_id)
+    try:
+        user = register_user_from_update(update)
+    except Exception as e:
+        await notify_error(context, chat_id, "Failed to register user", e)
+        return
+    if user is None:
+        return
+
+    if not bool(user.get("allowlisted")):
+        await reply(update, context, "Registered. Waiting for approval.")
+        return
+
+    await reply(
+        update,
+        context,
+        "Welcome, you're active. Use /settime and /settz.",
+        reply_markup=build_keyboard(None),
+    )
 
 
 async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    allowed_chat_id = context.application.bot_data["allowed_chat_id"]
-    if not is_allowed_chat(update, allowed_chat_id):
+    user = await require_allowlisted_user(update, context, "now")
+    if user is None:
+        return
+    chat_id = get_update_chat_id(update)
+    if chat_id is None:
         return
 
     user_id = update.effective_user.id if update.effective_user else None
-    logging.info("Command /now chat_id=%s user_id=%s", allowed_chat_id, user_id)
+    logging.info("Command /now chat_id=%s user_id=%s", chat_id, user_id)
 
     auth_path = context.application.bot_data["auth_path"]
     cache_path = context.application.bot_data["cache_path"]
@@ -191,7 +268,7 @@ async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             library_limit=limit,
         )
     except Exception as e:
-        await notify_error(context, allowed_chat_id, "Failed to pick an album", e)
+        await notify_error(context, chat_id, "Failed to pick an album", e)
         return
 
     elapsed_ms = int((perf_counter() - started_at) * 1000)
@@ -202,16 +279,19 @@ async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         album_log_summary(album),
     )
     prefix = "🔄 Library refreshed (cycle restarted)" if refreshed else None
-    await send_album(context, allowed_chat_id, album, prefix=prefix)
+    await send_album(context, chat_id, album, prefix=prefix)
 
 
 async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    allowed_chat_id = context.application.bot_data["allowed_chat_id"]
-    if not is_allowed_chat(update, allowed_chat_id):
+    user = await require_allowlisted_user(update, context, "refresh")
+    if user is None:
+        return
+    chat_id = get_update_chat_id(update)
+    if chat_id is None:
         return
 
     user_id = update.effective_user.id if update.effective_user else None
-    logging.info("Command /refresh chat_id=%s user_id=%s", allowed_chat_id, user_id)
+    logging.info("Command /refresh chat_id=%s user_id=%s", chat_id, user_id)
 
     auth_path = context.application.bot_data["auth_path"]
     cache_path = context.application.bot_data["cache_path"]
@@ -227,7 +307,7 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             limit=limit,
         )
     except Exception as e:
-        await notify_error(context, allowed_chat_id, "Failed to refresh library cache", e)
+        await notify_error(context, chat_id, "Failed to refresh library cache", e)
         return
 
     elapsed_ms = int((perf_counter() - started_at) * 1000)
@@ -243,12 +323,15 @@ def _fmt_ts(ts: Optional[int], tz: ZoneInfo) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S %Z")
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    allowed_chat_id = context.application.bot_data["allowed_chat_id"]
-    if not is_allowed_chat(update, allowed_chat_id):
+    user = await require_allowlisted_user(update, context, "status")
+    if user is None:
+        return
+    chat_id = get_update_chat_id(update)
+    if chat_id is None:
         return
 
     user_id = update.effective_user.id if update.effective_user else None
-    logging.info("Command /status chat_id=%s user_id=%s", allowed_chat_id, user_id)
+    logging.info("Command /status chat_id=%s user_id=%s", chat_id, user_id)
 
     cache_path = context.application.bot_data["cache_path"]
     history_path = context.application.bot_data["history_path"]
@@ -280,10 +363,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    allowed_chat_id = context.application.bot_data["allowed_chat_id"]
-    if not is_allowed_chat(update, allowed_chat_id):
-        return
-
     query = update.callback_query
     if query is None:
         return
@@ -293,11 +372,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await query.answer()
 
     data = query.data
+    user = await require_allowlisted_user(update, context, f"callback:{data or 'unknown'}")
+    if user is None:
+        return
+    chat_id = get_update_chat_id(update)
+    if chat_id is None:
+        return
     user_id = update.effective_user.id if update.effective_user else None
-    logging.info("Callback action=%s chat_id=%s user_id=%s", data, allowed_chat_id, user_id)
+    logging.info("Callback action=%s chat_id=%s user_id=%s", data, chat_id, user_id)
     if data == CB_NEXT:
         if not is_cooled_down(context.application, 2.0):
-            logging.info("Callback throttled action=%s chat_id=%s", data, allowed_chat_id)
+            logging.info("Callback throttled action=%s chat_id=%s", data, chat_id)
             await query.answer("Too fast 🙂", show_alert=False)
             return
         # Reuse the /now logic.
@@ -307,7 +392,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if data == CB_REFRESH:
         if not is_cooled_down(context.application, 2.0):
-            logging.info("Callback throttled action=%s chat_id=%s", data, allowed_chat_id)
+            logging.info("Callback throttled action=%s chat_id=%s", data, chat_id)
             await query.answer("Too fast 🙂", show_alert=False)
             return
         auth_path = context.application.bot_data["auth_path"]
@@ -323,7 +408,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 limit=limit,
             )
         except Exception as e:
-            await notify_error(context, allowed_chat_id, "Failed to refresh library cache", e)
+            await notify_error(context, chat_id, "Failed to refresh library cache", e)
             return
 
         elapsed_ms = int((perf_counter() - started_at) * 1000)
@@ -342,15 +427,19 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def daily_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Daily scheduled job: pick and send an album to the allowed chat.
-    allowed_chat_id = context.application.bot_data["allowed_chat_id"]
+    # Temporary compatibility path: if ALLOWED_CHAT_ID is set, daily job can still
+    # send there while allowlist-driven scheduling is not implemented yet.
+    admin_chat_id_override = context.application.bot_data["admin_chat_id_override"]
+    if admin_chat_id_override is None:
+        logging.info("Daily job skipped: ALLOWED_CHAT_ID admin override is not set")
+        return
 
     auth_path = context.application.bot_data["auth_path"]
     cache_path = context.application.bot_data["cache_path"]
     history_path = context.application.bot_data["history_path"]
     limit = context.application.bot_data["library_limit"]
 
-    logging.info("Daily job started chat_id=%s", allowed_chat_id)
+    logging.info("Daily job started chat_id=%s", admin_chat_id_override)
     started_at = perf_counter()
     try:
         album, refreshed = pick_random_album_no_repeat(
@@ -360,7 +449,7 @@ async def daily_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             library_limit=limit,
         )
     except Exception as e:
-        await notify_error(context, allowed_chat_id, "Daily job failed (cannot pick album)", e)
+        await notify_error(context, admin_chat_id_override, "Daily job failed (cannot pick album)", e)
         return
 
     elapsed_ms = int((perf_counter() - started_at) * 1000)
@@ -371,8 +460,8 @@ async def daily_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         album_log_summary(album),
     )
     prefix = "🔄 Library refreshed (cycle restarted)" if refreshed else "📅 Daily album"
-    await send_album(context, allowed_chat_id, album, prefix=prefix)
-    logging.info("Daily job message sent chat_id=%s", allowed_chat_id)
+    await send_album(context, admin_chat_id_override, album, prefix=prefix)
+    logging.info("Daily job message sent chat_id=%s", admin_chat_id_override)
 
 
 def main() -> None:
@@ -382,7 +471,7 @@ def main() -> None:
     if not token:
         raise RuntimeError("BOT_TOKEN is not set")
 
-    allowed_chat_id = get_env_int("ALLOWED_CHAT_ID")
+    admin_chat_id_override = get_optional_env_int("ALLOWED_CHAT_ID")
 
     tz_name = os.getenv("TZ", "Europe/Riga")
     tz = ZoneInfo(tz_name)
@@ -412,13 +501,13 @@ def main() -> None:
         tz_name,
         daily_time_str,
         library_limit,
-        allowed_chat_id,
+        admin_chat_id_override,
     )
 
     app = Application.builder().token(token).defaults(Defaults(tzinfo=tz)).build()
 
     # Store config in bot_data so handlers/jobs can access it.
-    app.bot_data["allowed_chat_id"] = allowed_chat_id
+    app.bot_data["admin_chat_id_override"] = admin_chat_id_override
     app.bot_data["auth_path"] = auth_path
     app.bot_data["cache_path"] = cache_path
     app.bot_data["history_path"] = history_path
