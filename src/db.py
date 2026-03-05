@@ -1,5 +1,6 @@
 import logging
 import os
+from datetime import time as dt_time
 from typing import Any, Dict, List, Optional
 
 import psycopg
@@ -175,4 +176,90 @@ def list_pending_users(limit: int = 20) -> List[UserRow]:
         return rows
     except Exception:
         logger.exception("DB list_pending_users failed limit=%s", limit)
+        raise
+
+
+def get_user_settings(user_id: int) -> UserRow:
+    logger.debug("DB get_user_settings started user_id=%s", user_id)
+    try:
+        with open_db_connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT timezone, daily_time_local
+                        FROM app.user_settings
+                        WHERE user_id = %s
+                        """,
+                        (user_id,),
+                    )
+                    row = cur.fetchone()
+        if row is None:
+            raise RuntimeError("Failed to load user settings")
+        logger.debug("DB get_user_settings done user_id=%s", user_id)
+        return row
+    except Exception:
+        logger.exception("DB get_user_settings failed user_id=%s", user_id)
+        raise
+
+
+def set_user_timezone(user_id: int, timezone: str) -> UserRow:
+    logger.debug("DB set_user_timezone started user_id=%s timezone=%s", user_id, timezone)
+    try:
+        with open_db_connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE app.user_settings
+                        SET
+                            timezone = %s,
+                            updated_at = NOW()
+                        WHERE user_id = %s
+                        RETURNING timezone, daily_time_local
+                        """,
+                        (timezone, user_id),
+                    )
+                    row = cur.fetchone()
+        if row is None:
+            raise RuntimeError("Failed to update user timezone")
+        logger.debug("DB set_user_timezone done user_id=%s timezone=%s", user_id, row.get("timezone"))
+        return row
+    except Exception:
+        logger.exception("DB set_user_timezone failed user_id=%s timezone=%s", user_id, timezone)
+        raise
+
+
+def set_user_daily_time(user_id: int, daily_time_local: dt_time) -> UserRow:
+    logger.debug("DB set_user_daily_time started user_id=%s daily_time_local=%s", user_id, daily_time_local)
+    try:
+        with open_db_connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE app.user_settings
+                        SET
+                            daily_time_local = %s,
+                            updated_at = NOW()
+                        WHERE user_id = %s
+                        RETURNING timezone, daily_time_local
+                        """,
+                        (daily_time_local, user_id),
+                    )
+                    row = cur.fetchone()
+        if row is None:
+            raise RuntimeError("Failed to update user daily time")
+        logger.debug(
+            "DB set_user_daily_time done user_id=%s daily_time_local=%s",
+            user_id,
+            row.get("daily_time_local"),
+        )
+        return row
+    except Exception:
+        logger.exception(
+            "DB set_user_daily_time failed user_id=%s daily_time_local=%s",
+            user_id,
+            daily_time_local,
+        )
         raise

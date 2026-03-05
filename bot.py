@@ -4,7 +4,7 @@ import os
 from datetime import datetime, time as dt_time
 from time import perf_counter
 from uuid import uuid4
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Any, Dict, Optional
 
 from dotenv import load_dotenv
@@ -26,7 +26,10 @@ from src.db import (
     approve_user,
     block_user,
     ensure_user_settings,
+    get_user_settings,
     list_pending_users,
+    set_user_daily_time,
+    set_user_timezone,
     upsert_user,
 )
 
@@ -99,6 +102,17 @@ def parse_daily_time(value: str) -> dt_time:
     hh = int(parts[0])
     mm = int(parts[1])
     return dt_time(hour=hh, minute=mm)
+
+
+def parse_time_hhmm(value: str) -> dt_time:
+    # Accept strict HH:MM 24-hour format only.
+    value = value.strip()
+    if len(value) != 5 or value[2] != ":":
+        raise ValueError("Time must be HH:MM (24h), e.g. 07:30")
+    parsed = dt_time.fromisoformat(value)
+    if parsed.second != 0 or parsed.microsecond != 0:
+        raise ValueError("Time must be HH:MM (24h), e.g. 07:30")
+    return parsed
 
 
 def get_optional_env_int(name: str) -> Optional[int]:
@@ -375,6 +389,72 @@ async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await reply(update, context, "\n".join(lines))
 
 
+async def cmd_settz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = await require_allowlisted_user(update, context, "settz")
+    if user is None:
+        return
+    chat_id = get_update_chat_id(update)
+    if chat_id is None:
+        return
+    if not context.args:
+        await reply(update, context, "Usage: /settz <IANA_TZ>\nExample: /settz Europe/Riga")
+        return
+
+    tz_name = context.args[0].strip()
+    try:
+        ZoneInfo(tz_name)
+    except ZoneInfoNotFoundError:
+        await reply(
+            update,
+            context,
+            "Invalid timezone. Use IANA format, for example: Europe/Riga",
+        )
+        return
+
+    try:
+        settings = set_user_timezone(user["id"], tz_name)
+    except Exception as e:
+        await notify_error(context, chat_id, "Failed to save timezone", e)
+        return
+
+    await reply(
+        update,
+        context,
+        f"✅ Timezone saved: {settings['timezone']}\nDaily time: {settings['daily_time_local']}",
+    )
+
+
+async def cmd_settime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = await require_allowlisted_user(update, context, "settime")
+    if user is None:
+        return
+    chat_id = get_update_chat_id(update)
+    if chat_id is None:
+        return
+    if not context.args:
+        await reply(update, context, "Usage: /settime <HH:MM>\nExample: /settime 07:30")
+        return
+
+    raw_time = context.args[0].strip()
+    try:
+        parsed_time = parse_time_hhmm(raw_time)
+    except ValueError:
+        await reply(update, context, "Invalid time. Use HH:MM (24h), for example: 07:30")
+        return
+
+    try:
+        settings = set_user_daily_time(user["id"], parsed_time)
+    except Exception as e:
+        await notify_error(context, chat_id, "Failed to save daily time", e)
+        return
+
+    await reply(
+        update,
+        context,
+        f"✅ Daily time saved: {settings['daily_time_local']}\nTimezone: {settings['timezone']}",
+    )
+
+
 async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = await require_allowlisted_user(update, context, "now")
     if user is None:
@@ -468,6 +548,11 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     cache_path = context.application.bot_data["cache_path"]
     history_path = context.application.bot_data["history_path"]
     tz = context.application.bot_data["tz"]
+    try:
+        settings = get_user_settings(user["id"])
+    except Exception as e:
+        await notify_error(context, chat_id, "Failed to load user settings", e)
+        return
 
     cache_payload = load_cache_payload(cache_path) or {}
     albums = cache_payload.get("albums") or []
@@ -484,6 +569,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         logging.warning("Status shows empty cached library")
 
     msg_lines = [
+        f"Access: allowlisted={user.get('allowlisted')} status={user.get('status')}",
+        f"Timezone: {settings.get('timezone')}",
+        f"Daily time: {settings.get('daily_time_local')}",
         f"Cached albums: {total}",
         f"Sent in current cycle: {sent_n}",
         f"Remaining: {remaining}",
@@ -652,6 +740,8 @@ def main() -> None:
     app.add_handler(CommandHandler("approve", cmd_approve))
     app.add_handler(CommandHandler("block", cmd_block))
     app.add_handler(CommandHandler("pending", cmd_pending))
+    app.add_handler(CommandHandler("settz", cmd_settz))
+    app.add_handler(CommandHandler("settime", cmd_settime))
     app.add_handler(CommandHandler("now", cmd_now))
     app.add_handler(CommandHandler("refresh", cmd_refresh))
     app.add_handler(CommandHandler("status", cmd_status))
