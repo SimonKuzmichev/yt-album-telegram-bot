@@ -22,7 +22,13 @@ from src.formatting import album_message, album_url
 from src.library import get_albums_with_cache, load_cache_payload
 from src.picker import pick_random_album_no_repeat
 from src.errors import is_auth_error, format_auth_help
-from src.db import upsert_user, ensure_user_settings
+from src.db import (
+    approve_user,
+    block_user,
+    ensure_user_settings,
+    list_pending_users,
+    upsert_user,
+)
 
 
 Album = Dict[str, Any]
@@ -173,6 +179,39 @@ async def require_allowlisted_user(
     )
     return user
 
+
+async def require_admin_override(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    action: str,
+) -> bool:
+    admin_chat_id_override = context.application.bot_data["admin_chat_id_override"]
+    chat_id = get_update_chat_id(update)
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if admin_chat_id_override is None:
+        logging.warning(
+            "Admin command denied (override not configured) action=%s chat_id=%s user_id=%s",
+            action,
+            chat_id,
+            user_id,
+        )
+        await reply(update, context, "Admin commands are disabled: ALLOWED_CHAT_ID is not configured.")
+        return False
+
+    if not _is_admin_override_chat(update, admin_chat_id_override):
+        logging.warning(
+            "Admin command denied (unauthorized chat) action=%s chat_id=%s user_id=%s",
+            action,
+            chat_id,
+            user_id,
+        )
+        await reply(update, context, "This command is admin-only.")
+        return False
+
+    logging.info("Admin command allowed action=%s chat_id=%s user_id=%s", action, chat_id, user_id)
+    return True
+
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Log exceptions from handlers/jobs.
     logging.exception("Unhandled exception in handler/job", exc_info=context.error)
@@ -241,6 +280,99 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Welcome, you're active. Use /settime and /settz.",
         reply_markup=build_keyboard(None),
     )
+
+
+async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_admin_override(update, context, "approve"):
+        return
+    chat_id = get_update_chat_id(update)
+    if chat_id is None:
+        return
+    if not context.args:
+        await reply(update, context, "Usage: /approve <telegram_user_id>")
+        return
+    try:
+        target_user_id = int(context.args[0])
+    except ValueError:
+        await reply(update, context, "Invalid user id. Usage: /approve <telegram_user_id>")
+        return
+
+    try:
+        row = approve_user(target_user_id)
+    except Exception as e:
+        await notify_error(context, chat_id, f"Failed to approve user {target_user_id}", e)
+        return
+    if row is None:
+        await reply(update, context, f"User not found: telegram_user_id={target_user_id}")
+        return
+
+    await reply(
+        update,
+        context,
+        (
+            f"✅ Approved telegram_user_id={row['telegram_user_id']}\n"
+            f"status={row['status']} allowlisted={row['allowlisted']}"
+        ),
+    )
+
+
+async def cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_admin_override(update, context, "block"):
+        return
+    chat_id = get_update_chat_id(update)
+    if chat_id is None:
+        return
+    if not context.args:
+        await reply(update, context, "Usage: /block <telegram_user_id>")
+        return
+    try:
+        target_user_id = int(context.args[0])
+    except ValueError:
+        await reply(update, context, "Invalid user id. Usage: /block <telegram_user_id>")
+        return
+
+    try:
+        row = block_user(target_user_id)
+    except Exception as e:
+        await notify_error(context, chat_id, f"Failed to block user {target_user_id}", e)
+        return
+    if row is None:
+        await reply(update, context, f"User not found: telegram_user_id={target_user_id}")
+        return
+
+    await reply(
+        update,
+        context,
+        (
+            f"⛔ Blocked telegram_user_id={row['telegram_user_id']}\n"
+            f"status={row['status']} allowlisted={row['allowlisted']}"
+        ),
+    )
+
+
+async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_admin_override(update, context, "pending"):
+        return
+    chat_id = get_update_chat_id(update)
+    if chat_id is None:
+        return
+
+    try:
+        rows = list_pending_users(limit=20)
+    except Exception as e:
+        await notify_error(context, chat_id, "Failed to list pending users", e)
+        return
+
+    if not rows:
+        await reply(update, context, "No pending users.")
+        return
+
+    lines = ["Pending users (latest 20):"]
+    for row in rows:
+        lines.append(
+            f"- {row['telegram_user_id']} chat={row['telegram_chat_id']} created={row['created_at']}"
+        )
+    await reply(update, context, "\n".join(lines))
 
 
 async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -517,6 +649,9 @@ def main() -> None:
 
     # Commands
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("approve", cmd_approve))
+    app.add_handler(CommandHandler("block", cmd_block))
+    app.add_handler(CommandHandler("pending", cmd_pending))
     app.add_handler(CommandHandler("now", cmd_now))
     app.add_handler(CommandHandler("refresh", cmd_refresh))
     app.add_handler(CommandHandler("status", cmd_status))

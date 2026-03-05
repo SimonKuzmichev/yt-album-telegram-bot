@@ -1,6 +1,6 @@
 import logging
 import os
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 import psycopg
 from psycopg.rows import dict_row
@@ -44,6 +44,28 @@ def _upsert_user_tx(conn: psycopg.Connection, telegram_user_id: int, telegram_ch
         if row is None:
             raise RuntimeError("Failed to upsert user")
         return row
+
+
+def _set_user_access_tx(
+    conn: psycopg.Connection,
+    telegram_user_id: int,
+    allowlisted: bool,
+    status: str,
+) -> Optional[UserRow]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE app.users
+            SET
+                allowlisted = %s,
+                status = %s,
+                updated_at = NOW()
+            WHERE telegram_user_id = %s
+            RETURNING id, telegram_user_id, telegram_chat_id, allowlisted, status, updated_at
+            """,
+            (allowlisted, status, telegram_user_id),
+        )
+        return cur.fetchone()
 
 
 def upsert_user(telegram_user_id: int, telegram_chat_id: int) -> UserRow:
@@ -93,4 +115,64 @@ def ensure_user_settings(user_id: int) -> None:
         logger.debug("DB ensure_user_settings done user_id=%s", user_id)
     except Exception:
         logger.exception("DB ensure_user_settings failed user_id=%s", user_id)
+        raise
+
+
+def approve_user(telegram_user_id: int) -> Optional[UserRow]:
+    logger.debug("DB approve_user started telegram_user_id=%s", telegram_user_id)
+    try:
+        with open_db_connection() as conn:
+            with conn.transaction():
+                row = _set_user_access_tx(
+                    conn=conn,
+                    telegram_user_id=telegram_user_id,
+                    allowlisted=True,
+                    status="active",
+                )
+        logger.debug("DB approve_user done telegram_user_id=%s found=%s", telegram_user_id, row is not None)
+        return row
+    except Exception:
+        logger.exception("DB approve_user failed telegram_user_id=%s", telegram_user_id)
+        raise
+
+
+def block_user(telegram_user_id: int) -> Optional[UserRow]:
+    logger.debug("DB block_user started telegram_user_id=%s", telegram_user_id)
+    try:
+        with open_db_connection() as conn:
+            with conn.transaction():
+                row = _set_user_access_tx(
+                    conn=conn,
+                    telegram_user_id=telegram_user_id,
+                    allowlisted=False,
+                    status="blocked",
+                )
+        logger.debug("DB block_user done telegram_user_id=%s found=%s", telegram_user_id, row is not None)
+        return row
+    except Exception:
+        logger.exception("DB block_user failed telegram_user_id=%s", telegram_user_id)
+        raise
+
+
+def list_pending_users(limit: int = 20) -> List[UserRow]:
+    logger.debug("DB list_pending_users started limit=%s", limit)
+    try:
+        with open_db_connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT id, telegram_user_id, telegram_chat_id, allowlisted, status, created_at
+                        FROM app.users
+                        WHERE status = 'pending'
+                        ORDER BY created_at DESC
+                        LIMIT %s
+                        """,
+                        (limit,),
+                    )
+                    rows = cur.fetchall()
+        logger.debug("DB list_pending_users done count=%s", len(rows))
+        return rows
+    except Exception:
+        logger.exception("DB list_pending_users failed limit=%s", limit)
         raise
