@@ -22,12 +22,14 @@ from src.db import (
     requeue_stale_running_jobs,
 )
 from src.library import get_albums_with_cache
+from src.logging_utils import configure_logging, log_event
 from src.telegram_delivery import send_album_message
 
 
 JOB_TYPE_DAILY_DELIVER = "daily_deliver"
 JOB_TYPE_DELIVER_NOW = "deliver_now"
 JOB_TYPE_NEXT_CYCLE_NOW = "next_cycle_now"
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -118,7 +120,14 @@ def enqueue_due_jobs(cfg: WorkerConfig) -> int:
                 cfg.due_window_seconds,
             )
         except ZoneInfoNotFoundError:
-            logging.warning("Skip user_id=%s due to invalid timezone=%s", user_id, timezone_name)
+            log_event(
+                logger,
+                logging.WARNING,
+                "invalid_user_timezone",
+                user_id=user_id,
+                telegram_chat_id=chat_id,
+                worker_id=cfg.worker_id,
+            )
             continue
 
         if not due:
@@ -140,11 +149,31 @@ def enqueue_due_jobs(cfg: WorkerConfig) -> int:
             },
         )
         if row is None:
-            logging.debug("Skip enqueue: idempotency exists key=%s", idem_key)
+            log_event(
+                logger,
+                logging.INFO,
+                "daily_enqueue_skipped_idempotency",
+                job_type=JOB_TYPE_DAILY_DELIVER,
+                user_id=user_id,
+                telegram_chat_id=chat_id,
+                idempotency_key=idem_key,
+                worker_id=cfg.worker_id,
+            )
             continue
 
         enqueued_count += 1
-        logging.info("Enqueued daily_deliver job user_id=%s key=%s", user_id, idem_key)
+        log_event(
+            logger,
+            logging.INFO,
+            "job_enqueued",
+            job_id=row.get("id"),
+            job_type=JOB_TYPE_DAILY_DELIVER,
+            user_id=user_id,
+            telegram_chat_id=chat_id,
+            attempt=row.get("attempt"),
+            idempotency_key=idem_key,
+            worker_id=cfg.worker_id,
+        )
 
     return enqueued_count
 
@@ -232,6 +261,20 @@ async def process_claimed_jobs(bot: Bot, cfg: WorkerConfig) -> int:
         attempt = int(job.get("attempt") or 0)
         payload = job.get("payload") or {}
         idem_key = payload.get("idempotency_key")
+        chat_id = payload.get("telegram_chat_id")
+
+        log_event(
+            logger,
+            logging.INFO,
+            "job_claimed",
+            job_id=job_id,
+            job_type=job_type,
+            user_id=job.get("user_id"),
+            telegram_chat_id=chat_id,
+            attempt=attempt,
+            idempotency_key=idem_key,
+            worker_id=cfg.worker_id,
+        )
 
         try:
             if job_type not in {JOB_TYPE_DAILY_DELIVER, JOB_TYPE_DELIVER_NOW, JOB_TYPE_NEXT_CYCLE_NOW}:
@@ -239,7 +282,18 @@ async def process_claimed_jobs(bot: Bot, cfg: WorkerConfig) -> int:
 
             await _execute_delivery_job(bot, cfg, job)
             mark_job_succeeded(job_id=job_id, idempotency_key=idem_key)
-            logging.info("Job succeeded id=%s type=%s", job_id, job_type)
+            log_event(
+                logger,
+                logging.INFO,
+                "job_succeeded",
+                job_id=job_id,
+                job_type=job_type,
+                user_id=job.get("user_id"),
+                telegram_chat_id=chat_id,
+                attempt=attempt,
+                idempotency_key=idem_key,
+                worker_id=cfg.worker_id,
+            )
         except Exception as exc:
             backoff_seconds = _compute_backoff_seconds(
                 attempt=attempt,
@@ -248,12 +302,19 @@ async def process_claimed_jobs(bot: Bot, cfg: WorkerConfig) -> int:
             )
             next_run_at = datetime.now(timezone.utc) + timedelta(seconds=backoff_seconds)
             state = mark_job_failed(job_id=job_id, error_text=str(exc), next_run_at=next_run_at)
-            logging.exception(
-                "Job failed id=%s type=%s next_status=%s next_run_at=%s",
-                job_id,
-                job_type,
-                state.get("status"),
-                state.get("run_at"),
+            log_event(
+                logger,
+                logging.ERROR,
+                "job_failed",
+                message=f"job_failed next_status={state.get('status')} next_run_at={state.get('run_at')}",
+                exc_info=True,
+                job_id=job_id,
+                job_type=job_type,
+                user_id=job.get("user_id"),
+                telegram_chat_id=chat_id,
+                attempt=state.get("attempt"),
+                idempotency_key=idem_key,
+                worker_id=cfg.worker_id,
             )
         processed += 1
 
@@ -263,11 +324,12 @@ async def process_claimed_jobs(bot: Bot, cfg: WorkerConfig) -> int:
 async def run_worker() -> None:
     cfg = _load_worker_config()
     bot = Bot(token=cfg.bot_token)
-    logging.info(
-        "Worker started worker_id=%s poll_seconds=%s claim_batch_size=%s",
-        cfg.worker_id,
-        cfg.poll_seconds,
-        cfg.claim_batch_size,
+    log_event(
+        logger,
+        logging.INFO,
+        "worker_started",
+        message=f"worker_started poll_seconds={cfg.poll_seconds} claim_batch_size={cfg.claim_batch_size}",
+        worker_id=cfg.worker_id,
     )
 
     while True:
@@ -276,10 +338,28 @@ async def run_worker() -> None:
             requeued = requeue_stale_running_jobs(cfg.job_lease_seconds)
             processed = await process_claimed_jobs(bot, cfg)
             if requeued:
-                logging.warning("Requeued stale running jobs count=%s lease_seconds=%s", requeued, cfg.job_lease_seconds)
-            logging.debug("Worker loop done enqueued=%s requeued=%s processed=%s", enqueued, requeued, processed)
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "stale_jobs_requeued",
+                    message=f"stale_jobs_requeued count={requeued} lease_seconds={cfg.job_lease_seconds}",
+                    worker_id=cfg.worker_id,
+                )
+            log_event(
+                logger,
+                logging.DEBUG,
+                "worker_loop_completed",
+                message=f"worker_loop_completed enqueued={enqueued} requeued={requeued} processed={processed}",
+                worker_id=cfg.worker_id,
+            )
         except Exception:
-            logging.exception("Worker loop failed")
+            log_event(
+                logger,
+                logging.ERROR,
+                "worker_loop_failed",
+                exc_info=True,
+                worker_id=cfg.worker_id,
+            )
         await asyncio.sleep(cfg.poll_seconds)
 
 
@@ -290,10 +370,7 @@ def main() -> None:
     if not isinstance(log_level, int):
         raise RuntimeError(f"Invalid LOG_LEVEL: {log_level_name}")
 
-    logging.basicConfig(
-        level=log_level,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    configure_logging(log_level)
     asyncio.run(run_worker())
 
 

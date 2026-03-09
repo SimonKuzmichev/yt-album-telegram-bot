@@ -46,7 +46,7 @@ TZ=Europe/Riga
 Notes:
 
 - `DATABASE_URL` is required by both `bot.py` and `worker.py`.
-- `ALLOWED_CHAT_ID` is only an admin override for admin-only commands such as `/approve`, `/block`, `/pending`, and `/refresh`.
+- `ALLOWED_CHAT_ID` is only an admin override for admin-only commands such as `/approve`, `/block`, `/admin_status`, and `/refresh`.
 - Daily scheduling is executed by `worker.py` using per-user settings stored in the DB.
 - `DAILY_TIME` and `TZ` are still validated by `bot.py` at startup, but real daily delivery timing comes from DB user settings.
 - `WORKER_JOB_LEASE_SECONDS` controls when `running` jobs are considered stale and requeued after a worker crash.

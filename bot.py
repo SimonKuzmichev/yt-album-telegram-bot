@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 from datetime import datetime, time as dt_time, timedelta, timezone
+from time import perf_counter
 from uuid import NAMESPACE_URL, uuid4, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Any, Dict, Optional
@@ -18,15 +19,16 @@ from telegram.ext import (
 
 from src.library import get_albums_with_cache, load_cache_payload
 from src.errors import is_auth_error, format_auth_help
+from src.logging_utils import configure_logging, log_event
 from src.db import (
     approve_user,
     block_user,
     enqueue_job_once,
     ensure_user_settings,
+    get_admin_status_snapshot,
     get_user_delivery_stats,
     get_user_settings,
     list_recent_deliveries,
-    list_pending_users,
     set_user_daily_time,
     set_user_timezone,
     upsert_user,
@@ -43,6 +45,35 @@ from src.telegram_delivery import (
 Album = Dict[str, Any]
 JOB_TYPE_DELIVER_NOW = "deliver_now"
 JOB_TYPE_NEXT_CYCLE_NOW = "next_cycle_now"
+logger = logging.getLogger(__name__)
+
+
+def _log_bot_event(
+    event: str,
+    *,
+    level: int = logging.INFO,
+    message: str | None = None,
+    exc_info: Any = None,
+    user_id: Optional[int] = None,
+    telegram_chat_id: Optional[int] = None,
+    job_id: Optional[str] = None,
+    job_type: Optional[str] = None,
+    attempt: Optional[int] = None,
+    idempotency_key: Optional[str] = None,
+) -> None:
+    log_event(
+        logger,
+        level,
+        event,
+        message=message,
+        exc_info=exc_info,
+        user_id=user_id,
+        telegram_chat_id=telegram_chat_id,
+        job_id=job_id,
+        job_type=job_type,
+        attempt=attempt,
+        idempotency_key=idempotency_key,
+    )
 
 def is_cooled_down(app: Application, min_seconds: float = 2.0) -> bool:
     # Global callback throttle: one shared timestamp in app.bot_data for the whole bot
@@ -68,7 +99,12 @@ async def enforce_cooldown(
 
     chat_id = get_update_chat_id(update)
     user_id = update.effective_user.id if update.effective_user else None
-    logging.info("Action throttled action=%s chat_id=%s user_id=%s", action, chat_id, user_id)
+    _log_bot_event(
+        "action_throttled",
+        message=f"action_throttled action={action}",
+        user_id=user_id,
+        telegram_chat_id=chat_id,
+    )
     if update.callback_query is not None:
         await update.callback_query.answer("Too fast 🙂", show_alert=False)
     else:
@@ -132,7 +168,7 @@ def _is_admin_override_chat(update: Update, admin_chat_id_override: Optional[int
 def register_user_from_update(update: Update) -> Optional[Dict[str, Any]]:
     # Register/update Telegram identity in DB and ensure defaults in app.user_settings.
     if update.effective_user is None or update.effective_chat is None:
-        logging.warning("Cannot register user: missing effective_user or effective_chat")
+        _log_bot_event("user_registration_skipped", level=logging.WARNING)
         return None
     user = upsert_user(
         telegram_user_id=update.effective_user.id,
@@ -140,6 +176,11 @@ def register_user_from_update(update: Update) -> Optional[Dict[str, Any]]:
         username=update.effective_user.username,
     )
     ensure_user_settings(user["id"])
+    _log_bot_event(
+        "user_registered",
+        user_id=user["id"],
+        telegram_chat_id=update.effective_chat.id,
+    )
     return user
 
 
@@ -157,38 +198,43 @@ async def require_allowlisted_user(
     except Exception as e:
         if chat_id is not None:
             await notify_error(context, chat_id, f"Failed to register user for {action}", e)
-        logging.exception("DB registration failed action=%s chat_id=%s user_id=%s", action, chat_id, user_id)
+        _log_bot_event(
+            "user_registration_failed",
+            level=logging.ERROR,
+            message=f"user_registration_failed action={action}",
+            exc_info=True,
+            user_id=user_id,
+            telegram_chat_id=chat_id,
+        )
         return None
 
     if user is None:
         return None
 
     if _is_admin_override_chat(update, admin_chat_id_override):
-        logging.info(
-            "Access granted via admin override action=%s chat_id=%s user_id=%s",
-            action,
-            chat_id,
-            user_id,
+        _log_bot_event(
+            "access_granted_admin_override",
+            message=f"access_granted_admin_override action={action}",
+            user_id=user_id,
+            telegram_chat_id=chat_id,
         )
         return user
 
     if not bool(user.get("allowlisted")):
-        logging.info(
-            "Access denied (not allowlisted) action=%s chat_id=%s user_id=%s status=%s",
-            action,
-            chat_id,
-            user_id,
-            user.get("status"),
+        _log_bot_event(
+            "access_denied_not_allowlisted",
+            message=f"access_denied_not_allowlisted action={action} status={user.get('status')}",
+            user_id=user.get("id"),
+            telegram_chat_id=chat_id,
         )
         await reply(update, context, "Registered. Waiting for approval.")
         return None
 
-    logging.info(
-        "Access granted action=%s chat_id=%s user_id=%s status=%s",
-        action,
-        chat_id,
-        user_id,
-        user.get("status"),
+    _log_bot_event(
+        "access_granted",
+        message=f"access_granted action={action} status={user.get('status')}",
+        user_id=user.get("id"),
+        telegram_chat_id=chat_id,
     )
     return user
 
@@ -203,31 +249,38 @@ async def require_admin_override(
     user_id = update.effective_user.id if update.effective_user else None
 
     if admin_chat_id_override is None:
-        logging.warning(
-            "Admin command denied (override not configured) action=%s chat_id=%s user_id=%s",
-            action,
-            chat_id,
-            user_id,
+        _log_bot_event(
+            "admin_command_denied_unconfigured",
+            level=logging.WARNING,
+            message=f"admin_command_denied_unconfigured action={action}",
+            user_id=user_id,
+            telegram_chat_id=chat_id,
         )
         await reply(update, context, "Admin commands are disabled: ALLOWED_CHAT_ID is not configured.")
         return False
 
     if not _is_admin_override_chat(update, admin_chat_id_override):
-        logging.warning(
-            "Admin command denied (unauthorized chat) action=%s chat_id=%s user_id=%s",
-            action,
-            chat_id,
-            user_id,
+        _log_bot_event(
+            "admin_command_denied_unauthorized",
+            level=logging.WARNING,
+            message=f"admin_command_denied_unauthorized action={action}",
+            user_id=user_id,
+            telegram_chat_id=chat_id,
         )
         await reply(update, context, "This command is admin-only.")
         return False
 
-    logging.info("Admin command allowed action=%s chat_id=%s user_id=%s", action, chat_id, user_id)
+    _log_bot_event(
+        "admin_command_allowed",
+        message=f"admin_command_allowed action={action}",
+        user_id=user_id,
+        telegram_chat_id=chat_id,
+    )
     return True
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Log exceptions from handlers/jobs.
-    logging.exception("Unhandled exception in handler/job", exc_info=context.error)
+    _log_bot_event("handler_error", level=logging.ERROR, exc_info=context.error)
 
 async def notify_error(
     context: ContextTypes.DEFAULT_TYPE,
@@ -239,7 +292,13 @@ async def notify_error(
     Sends a user-friendly error message to Telegram and logs details.
     """
     error_id = uuid4().hex[:8]
-    logging.exception("%s [error_id=%s]: %s", title, error_id, exc)
+    _log_bot_event(
+        "notify_error",
+        level=logging.ERROR,
+        message=f"{title} [error_id={error_id}]",
+        exc_info=exc,
+        telegram_chat_id=chat_id,
+    )
 
     # Do not expose raw exception details in user-visible messages.
     msg = (
@@ -264,17 +323,17 @@ async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, r
         return
 
     # Fallback: no route to reply.
-    logging.warning("Reply skipped: no message or callback message in update")
+    _log_bot_event("reply_skipped", level=logging.WARNING)
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = get_update_chat_id(update)
     user_id = update.effective_user.id if update.effective_user else None
     if chat_id is None:
-        logging.warning("Command /start without effective_chat user_id=%s", user_id)
+        _log_bot_event("start_missing_chat", level=logging.WARNING, user_id=user_id)
         return
 
-    logging.info("Command /start chat_id=%s user_id=%s", chat_id, user_id)
+    _log_bot_event("command_start", user_id=user_id, telegram_chat_id=chat_id)
     try:
         user = register_user_from_update(update)
     except Exception as e:
@@ -319,6 +378,12 @@ async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await reply(update, context, f"User not found: telegram_user_id={target_user_id}")
         return
 
+    _log_bot_event(
+        "user_approved",
+        user_id=row["id"],
+        telegram_chat_id=row["telegram_chat_id"],
+    )
+
     await reply(
         update,
         context,
@@ -353,6 +418,12 @@ async def cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await reply(update, context, f"User not found: telegram_user_id={target_user_id}")
         return
 
+    _log_bot_event(
+        "user_blocked",
+        user_id=row["id"],
+        telegram_chat_id=row["telegram_chat_id"],
+    )
+
     await reply(
         update,
         context,
@@ -363,28 +434,54 @@ async def cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_admin_override(update, context, "pending"):
+async def cmd_admin_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_admin_override(update, context, "admin_status"):
         return
     chat_id = get_update_chat_id(update)
     if chat_id is None:
         return
 
     try:
-        rows = list_pending_users(limit=20)
+        snapshot = get_admin_status_snapshot(pending_limit=20)
     except Exception as e:
-        await notify_error(context, chat_id, "Failed to list pending users", e)
+        await notify_error(context, chat_id, "Failed to load admin status", e)
         return
 
-    if not rows:
-        await reply(update, context, "No pending users.")
-        return
+    _log_bot_event("admin_status_requested", telegram_chat_id=chat_id)
 
-    lines = ["Pending users (latest 20):"]
-    for row in rows:
-        lines.append(
-            f"- {row['telegram_user_id']} chat={row['telegram_chat_id']} created={row['created_at']} username={row['username']}"
-        )
+    pending_users = snapshot["pending_users"]
+    lines = ["Pending users:"]
+    if pending_users:
+        for row in pending_users:
+            lines.append(
+                f"- tg_user={row['telegram_user_id']} chat={row['telegram_chat_id']} created={row['created_at']} username={row['username']}"
+            )
+    else:
+        lines.append("- none")
+
+    lines.extend(
+        [
+            "",
+            f"Queued jobs count: {snapshot['queued_jobs_count']}",
+            f"Running jobs count: {snapshot['running_jobs_count']}",
+            f"Failed/dead jobs count: {snapshot['failed_dead_jobs_count']}",
+            "",
+            "Last delivery per user:",
+        ]
+    )
+
+    last_deliveries = snapshot["last_delivery_per_user"]
+    if last_deliveries:
+        for row in last_deliveries:
+            delivered_at = row.get("delivered_at")
+            delivered_text = _fmt_ts(delivered_at, context.application.bot_data["tz"]) if delivered_at else "n/a"
+            lines.append(
+                f"- user={row['user_id']} tg_user={row['telegram_user_id']} chat={row['telegram_chat_id']} "
+                f"last={delivered_text} album={row.get('album_id') or 'n/a'} cycle={row.get('cycle_number') or 'n/a'}"
+            )
+    else:
+        lines.append("- none")
+
     await reply(update, context, "\n".join(lines))
 
 
@@ -415,6 +512,13 @@ async def cmd_settz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as e:
         await notify_error(context, chat_id, "Failed to save timezone", e)
         return
+
+    _log_bot_event(
+        "schedule_updated",
+        message=f"schedule_updated field=timezone timezone={settings['timezone']}",
+        user_id=user["id"],
+        telegram_chat_id=chat_id,
+    )
 
     await reply(
         update,
@@ -447,6 +551,13 @@ async def cmd_settime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await notify_error(context, chat_id, "Failed to save daily time", e)
         return
 
+    _log_bot_event(
+        "schedule_updated",
+        message=f"schedule_updated field=daily_time_local daily_time_local={settings['daily_time_local']}",
+        user_id=user["id"],
+        telegram_chat_id=chat_id,
+    )
+
     await reply(
         update,
         context,
@@ -465,7 +576,7 @@ async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     user_id = update.effective_user.id if update.effective_user else None
-    logging.info("Command /now chat_id=%s user_id=%s", chat_id, user_id)
+    _log_bot_event("command_now", user_id=user["id"], telegram_chat_id=chat_id)
     request_id = get_request_id(update)
     idem_key = f"manual:{user['id']}:{request_id}"
 
@@ -484,19 +595,24 @@ async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             },
         )
         if row is not None:
-            logging.info(
-                "Queued deliver_now user_id=%s telegram_user_id=%s request_id=%s",
-                user["id"],
-                user_id,
-                request_id,
+            _log_bot_event(
+                "manual_delivery_requested",
+                user_id=user["id"],
+                telegram_chat_id=chat_id,
+                job_id=row.get("id"),
+                job_type=JOB_TYPE_DELIVER_NOW,
+                attempt=row.get("attempt"),
+                idempotency_key=idem_key,
             )
             await reply(update, context, "Queued ✅")
         else:
-            logging.info(
-                "Skipped duplicate deliver_now enqueue user_id=%s telegram_user_id=%s request_id=%s",
-                user["id"],
-                user_id,
-                request_id,
+            _log_bot_event(
+                "manual_delivery_requested",
+                message="manual_delivery_requested duplicate=true",
+                user_id=user["id"],
+                telegram_chat_id=chat_id,
+                job_type=JOB_TYPE_DELIVER_NOW,
+                idempotency_key=idem_key,
             )
             await reply(update, context, "Expect the previous album to arrive soon 🙂")
     except Exception as e:
@@ -509,7 +625,7 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not _is_admin_override_chat(update, admin_chat_id_override):
         chat_id = get_update_chat_id(update)
         user_id = update.effective_user.id if update.effective_user else None
-        logging.info("Refresh denied chat_id=%s user_id=%s", chat_id, user_id)
+        _log_bot_event("refresh_denied", user_id=user_id, telegram_chat_id=chat_id)
         await reply(update, context, "Not allowed.")
         return
     chat_id = get_update_chat_id(update)
@@ -519,7 +635,7 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     user_id = update.effective_user.id if update.effective_user else None
-    logging.info("Command /refresh chat_id=%s user_id=%s", chat_id, user_id)
+    _log_bot_event("command_refresh", user_id=user_id, telegram_chat_id=chat_id)
 
     auth_path = context.application.bot_data["auth_path"]
     cache_path = context.application.bot_data["cache_path"]
@@ -539,9 +655,20 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     elapsed_ms = int((perf_counter() - started_at) * 1000)
-    logging.info("Library refreshed source=command albums=%s elapsed_ms=%s", len(albums), elapsed_ms)
+    _log_bot_event(
+        "library_refreshed",
+        message=f"library_refreshed source=command albums={len(albums)} elapsed_ms={elapsed_ms}",
+        user_id=user_id,
+        telegram_chat_id=chat_id,
+    )
     if not albums:
-        logging.warning("Library refresh returned empty album list source=command")
+        _log_bot_event(
+            "library_refresh_empty",
+            level=logging.WARNING,
+            message="library_refresh_empty source=command",
+            user_id=user_id,
+            telegram_chat_id=chat_id,
+        )
     await reply(update, context, f"✅ Refreshed. Cached albums: {len(albums)}", reply_markup=build_keyboard(None))
 
 
@@ -556,7 +683,7 @@ async def cmd_nextcycle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     user_id = update.effective_user.id if update.effective_user else None
-    logging.info("Command /nextcycle chat_id=%s user_id=%s", chat_id, user_id)
+    _log_bot_event("command_nextcycle", user_id=user["id"], telegram_chat_id=chat_id)
     request_id = get_request_id(update)
     idem_key = f"nextcycle:{user['id']}:{request_id}"
     try:
@@ -575,19 +702,25 @@ async def cmd_nextcycle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             },
         )
         if row is not None:
-            logging.info(
-                "Queued next_cycle_now user_id=%s telegram_user_id=%s request_id=%s",
-                user["id"],
-                user_id,
-                request_id,
+            _log_bot_event(
+                "manual_delivery_requested",
+                message="manual_delivery_requested force_next_cycle=true",
+                user_id=user["id"],
+                telegram_chat_id=chat_id,
+                job_id=row.get("id"),
+                job_type=JOB_TYPE_NEXT_CYCLE_NOW,
+                attempt=row.get("attempt"),
+                idempotency_key=idem_key,
             )
             await reply(update, context, "Queued ✅ New cycle album will arrive soon")
         else:
-            logging.info(
-                "Skipped duplicate next_cycle_now enqueue user_id=%s telegram_user_id=%s request_id=%s",
-                user["id"],
-                user_id,
-                request_id,
+            _log_bot_event(
+                "manual_delivery_requested",
+                message="manual_delivery_requested duplicate=true force_next_cycle=true",
+                user_id=user["id"],
+                telegram_chat_id=chat_id,
+                job_type=JOB_TYPE_NEXT_CYCLE_NOW,
+                idempotency_key=idem_key,
             )
             await reply(update, context, "Expect the previous new-cycle album to arrive soon 🙂")
     except Exception as e:
@@ -609,7 +742,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     user_id = update.effective_user.id if update.effective_user else None
-    logging.info("Command /status chat_id=%s user_id=%s", chat_id, user_id)
+    _log_bot_event("command_status", user_id=user["id"], telegram_chat_id=chat_id)
 
     cache_path = context.application.bot_data["cache_path"]
     tz = context.application.bot_data["tz"]
@@ -626,9 +759,19 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     cache_updated = cache_payload.get("updated_at")
 
     total = len(albums)
-    logging.info("Status snapshot cached_albums=%s", total)
+    _log_bot_event(
+        "status_snapshot",
+        message=f"status_snapshot cached_albums={total}",
+        user_id=user["id"],
+        telegram_chat_id=chat_id,
+    )
     if total == 0:
-        logging.warning("Status shows empty cached library")
+        _log_bot_event(
+            "status_empty_cache",
+            level=logging.WARNING,
+            user_id=user["id"],
+            telegram_chat_id=chat_id,
+        )
 
     msg_lines = [
         "DB user:",
@@ -672,7 +815,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if chat_id is None:
         return
     user_id = update.effective_user.id if update.effective_user else None
-    logging.info("Callback action=%s chat_id=%s user_id=%s", data, chat_id, user_id)
+    _log_bot_event(
+        "callback_received",
+        message=f"callback_received action={data}",
+        user_id=user.get("id"),
+        telegram_chat_id=chat_id,
+    )
     if data == CB_NEXT:
         # Reuse the /now logic.
         fake_update = update
@@ -711,18 +859,15 @@ def main() -> None:
     if not isinstance(log_level, int):
         raise RuntimeError(f"Invalid LOG_LEVEL: {log_level_name}")
 
-    logging.basicConfig(
-        level=log_level,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    configure_logging(log_level)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
-    logging.info(
-        "Bot startup TZ=%s DAILY_TIME=%s LIBRARY_LIMIT=%s ALLOWED_CHAT_ID=%s",
-        tz_name,
-        daily_time_str,
-        library_limit,
-        admin_chat_id_override,
+    _log_bot_event(
+        "bot_started",
+        message=(
+            f"bot_started tz={tz_name} daily_time={daily_time_str} "
+            f"library_limit={library_limit} allowed_chat_id={admin_chat_id_override}"
+        ),
     )
 
     app = Application.builder().token(token).defaults(Defaults(tzinfo=tz)).build()
@@ -739,7 +884,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("approve", cmd_approve))
     app.add_handler(CommandHandler("block", cmd_block))
-    app.add_handler(CommandHandler("pending", cmd_pending))
+    app.add_handler(CommandHandler("admin_status", cmd_admin_status))
     app.add_handler(CommandHandler("settz", cmd_settz))
     app.add_handler(CommandHandler("settime", cmd_settime))
     app.add_handler(CommandHandler("now", cmd_now))

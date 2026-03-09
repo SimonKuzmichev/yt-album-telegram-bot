@@ -763,3 +763,76 @@ def list_recent_deliveries(user_id: int, limit: int = 5) -> List[UserRow]:
     except Exception:
         logger.exception("DB list_recent_deliveries failed user_id=%s", user_id)
         raise
+
+
+def get_admin_status_snapshot(pending_limit: int = 20) -> Dict[str, Any]:
+    logger.debug("DB get_admin_status_snapshot started pending_limit=%s", pending_limit)
+    try:
+        with open_db_connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT id, telegram_user_id, telegram_chat_id, username, created_at
+                        FROM app.users
+                        WHERE status = 'pending'
+                        ORDER BY created_at DESC
+                        LIMIT %s
+                        """,
+                        (pending_limit,),
+                    )
+                    pending_users = cur.fetchall()
+
+                    cur.execute(
+                        """
+                        SELECT
+                            COUNT(*) FILTER (WHERE status = 'queued')::BIGINT AS queued_jobs_count,
+                            COUNT(*) FILTER (WHERE status = 'running')::BIGINT AS running_jobs_count,
+                            COUNT(*) FILTER (WHERE status IN ('failed', 'dead'))::BIGINT AS failed_dead_jobs_count
+                        FROM app.jobs
+                        """
+                    )
+                    counts = cur.fetchone() or {}
+
+                    cur.execute(
+                        """
+                        SELECT
+                            u.id AS user_id,
+                            u.telegram_user_id,
+                            u.telegram_chat_id,
+                            u.username,
+                            latest.album_id,
+                            latest.cycle_number,
+                            latest.delivered_at
+                        FROM app.users AS u
+                        LEFT JOIN LATERAL (
+                            SELECT album_id, cycle_number, delivered_at
+                            FROM app.delivery_history AS dh
+                            WHERE dh.user_id = u.id
+                            ORDER BY delivered_at DESC, id DESC
+                            LIMIT 1
+                        ) AS latest ON TRUE
+                        ORDER BY u.id ASC
+                        """
+                    )
+                    last_delivery_per_user = cur.fetchall()
+
+        result = {
+            "pending_users": pending_users,
+            "queued_jobs_count": int(counts.get("queued_jobs_count") or 0),
+            "running_jobs_count": int(counts.get("running_jobs_count") or 0),
+            "failed_dead_jobs_count": int(counts.get("failed_dead_jobs_count") or 0),
+            "last_delivery_per_user": last_delivery_per_user,
+        }
+        logger.debug(
+            "DB get_admin_status_snapshot done pending=%s queued=%s running=%s failed_dead=%s users=%s",
+            len(pending_users),
+            result["queued_jobs_count"],
+            result["running_jobs_count"],
+            result["failed_dead_jobs_count"],
+            len(last_delivery_per_user),
+        )
+        return result
+    except Exception:
+        logger.exception("DB get_admin_status_snapshot failed pending_limit=%s", pending_limit)
+        raise
