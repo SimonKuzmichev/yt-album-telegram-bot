@@ -10,6 +10,8 @@ cleanup() {
 
 trap cleanup EXIT
 
+docker compose up -d db --wait
+
 psql postgresql://app:app@localhost:5432/postgres -c "DROP DATABASE IF EXISTS ${TEST_DB_NAME};"
 
 psql postgresql://app:app@localhost:5432/postgres -c "CREATE DATABASE ${TEST_DB_NAME};"
