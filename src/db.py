@@ -214,6 +214,36 @@ def get_user_settings(user_id: int) -> UserRow:
         raise
 
 
+def get_user_timezone_by_chat_id(telegram_chat_id: int) -> Optional[str]:
+    logger.debug("DB get_user_timezone_by_chat_id started telegram_chat_id=%s", telegram_chat_id)
+    try:
+        with open_db_connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT s.timezone
+                        FROM app.users AS u
+                        JOIN app.user_settings AS s ON s.user_id = u.id
+                        WHERE u.telegram_chat_id = %s
+                        ORDER BY u.id DESC
+                        LIMIT 1
+                        """,
+                        (telegram_chat_id,),
+                    )
+                    row = cur.fetchone()
+        timezone_name = str(row["timezone"]) if row and row.get("timezone") else None
+        logger.debug(
+            "DB get_user_timezone_by_chat_id done telegram_chat_id=%s timezone=%s",
+            telegram_chat_id,
+            timezone_name,
+        )
+        return timezone_name
+    except Exception:
+        logger.exception("DB get_user_timezone_by_chat_id failed telegram_chat_id=%s", telegram_chat_id)
+        raise
+
+
 def set_user_timezone(user_id: int, timezone: str) -> UserRow:
     logger.debug("DB set_user_timezone started user_id=%s timezone=%s", user_id, timezone)
     try:

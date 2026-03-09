@@ -68,6 +68,7 @@ def install_module_stubs() -> None:
             "get_latest_cycle_number",
             "get_user_delivery_stats",
             "get_user_settings",
+            "get_user_timezone_by_chat_id",
             "insert_delivery_history",
             "list_active_users_with_settings",
             "list_cycle_album_ids",

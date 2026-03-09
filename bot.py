@@ -26,6 +26,7 @@ from src.db import (
     enqueue_job_once,
     ensure_user_settings,
     get_admin_status_snapshot,
+    get_user_timezone_by_chat_id,
     get_user_delivery_stats,
     get_user_settings,
     list_recent_deliveries,
@@ -110,16 +111,6 @@ async def enforce_cooldown(
     else:
         await reply(update, context, "Too fast 🙂")
     return False
-
-def parse_daily_time(value: str) -> dt_time:
-    # Parse HH:MM into datetime.time.
-    parts = value.strip().split(":")
-    if len(parts) != 2:
-        raise ValueError("DAILY_TIME must be in HH:MM format, e.g. 09:30")
-    hh = int(parts[0])
-    mm = int(parts[1])
-    return dt_time(hour=hh, minute=mm)
-
 
 def parse_time_hhmm(value: str) -> dt_time:
     # Accept strict HH:MM 24-hour format only.
@@ -733,6 +724,20 @@ def _fmt_ts(ts: Optional[Any], tz: ZoneInfo) -> str:
     dt = ts.astimezone(tz)
     return dt.strftime("%Y-%m-%d %H:%M:%S %Z")
 
+
+def resolve_app_timezone(
+    admin_chat_id_override: Optional[int],
+    default_timezone_name: str = "UTC",
+) -> ZoneInfo:
+    timezone_name = default_timezone_name
+
+    if admin_chat_id_override is not None:
+        db_timezone_name = get_user_timezone_by_chat_id(admin_chat_id_override)
+        if db_timezone_name:
+            timezone_name = db_timezone_name
+
+    return ZoneInfo(timezone_name)
+
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = await require_allowlisted_user(update, context, "status")
     if user is None:
@@ -844,12 +849,8 @@ def main() -> None:
         raise RuntimeError("BOT_TOKEN is not set")
 
     admin_chat_id_override = get_optional_env_int("ALLOWED_CHAT_ID")
-
-    tz_name = os.getenv("TZ", "Europe/Riga")
-    tz = ZoneInfo(tz_name)
-
-    daily_time_str = os.getenv("DAILY_TIME", "09:30")
-    parse_daily_time(daily_time_str)
+    default_timezone_name = os.getenv("DEFAULT_TIMEZONE", "UTC").strip() or "UTC"
+    tz = resolve_app_timezone(admin_chat_id_override, default_timezone_name)
 
     auth_path = os.getenv("YTM_AUTH_PATH", "secrets/browser.json")
     cache_path = os.getenv("ALBUM_CACHE_PATH", "data/albums_cache.json")
@@ -865,7 +866,7 @@ def main() -> None:
     _log_bot_event(
         "bot_started",
         message=(
-            f"bot_started tz={tz_name} daily_time={daily_time_str} "
+            f"bot_started tz={tz.key} "
             f"library_limit={library_limit} allowed_chat_id={admin_chat_id_override}"
         ),
     )

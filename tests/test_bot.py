@@ -15,21 +15,9 @@ from bot import (
     _is_admin_override_chat,
     get_optional_env_int,
     get_request_id,
-    parse_daily_time,
     parse_time_hhmm,
+    resolve_app_timezone,
 )
-
-
-class ParseDailyTimeTests(unittest.TestCase):
-    def test_parses_hhmm(self) -> None:
-        self.assertEqual(parse_daily_time("09:30"), dt_time(9, 30))
-
-    def test_strips_whitespace(self) -> None:
-        self.assertEqual(parse_daily_time(" 18:05 "), dt_time(18, 5))
-
-    def test_rejects_missing_colon(self) -> None:
-        with self.assertRaises(ValueError):
-            parse_daily_time("0930")
 
 
 class ParseTimeHhmmTests(unittest.TestCase):
@@ -126,6 +114,27 @@ class FmtTsTests(unittest.TestCase):
         ts = datetime(2026, 3, 9, 6, 0, tzinfo=timezone.utc)
         formatted = _fmt_ts(ts, ZoneInfo("Europe/Riga"))
         self.assertEqual(formatted, "2026-03-09 08:00:00 EET")
+
+
+class ResolveAppTimezoneTests(unittest.TestCase):
+    def test_uses_admin_timezone_from_db_when_present(self) -> None:
+        with patch("bot.get_user_timezone_by_chat_id", return_value="Europe/Riga"):
+            resolved = resolve_app_timezone(123, "UTC")
+
+        self.assertEqual(resolved.key, "Europe/Riga")
+
+    def test_falls_back_to_default_when_admin_not_in_db(self) -> None:
+        with patch("bot.get_user_timezone_by_chat_id", return_value=None):
+            resolved = resolve_app_timezone(123, "UTC")
+
+        self.assertEqual(resolved.key, "UTC")
+
+    def test_falls_back_to_default_when_admin_override_missing(self) -> None:
+        with patch("bot.get_user_timezone_by_chat_id") as get_timezone:
+            resolved = resolve_app_timezone(None, "Europe/Riga")
+
+        get_timezone.assert_not_called()
+        self.assertEqual(resolved.key, "Europe/Riga")
 
 
 if __name__ == "__main__":

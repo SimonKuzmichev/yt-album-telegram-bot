@@ -39,8 +39,7 @@ YTM_AUTH_PATH=secrets/browser.json
 ALBUM_CACHE_PATH=data/albums_cache.json
 LIBRARY_LIMIT=500
 
-DAILY_TIME=09:30
-TZ=Europe/Riga
+DEFAULT_TIMEZONE=UTC
 ```
 
 Notes:
@@ -48,7 +47,8 @@ Notes:
 - `DATABASE_URL` is required by both `bot.py` and `worker.py`.
 - `ALLOWED_CHAT_ID` is only an admin override for admin-only commands such as `/approve`, `/block`, `/admin_status`, and `/refresh`.
 - Daily scheduling is executed by `worker.py` using per-user settings stored in the DB.
-- `DAILY_TIME` and `TZ` are still validated by `bot.py` at startup, but real daily delivery timing comes from DB user settings.
+- `DAILY_TIME` is no longer used.
+- `bot.py` resolves its app timezone from the admin override user's DB settings when that user exists; otherwise it falls back to `DEFAULT_TIMEZONE`.
 - `WORKER_JOB_LEASE_SECONDS` controls when `running` jobs are considered stale and requeued after a worker crash.
 
 ## Setup
