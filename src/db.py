@@ -335,6 +335,73 @@ def try_insert_idempotency_key(
         raise
 
 
+def enqueue_job_once(
+    *,
+    idempotency_key: str,
+    idempotency_expires_at: Optional[datetime],
+    job_id: UUID,
+    user_id: int,
+    job_type: str,
+    run_at: datetime,
+    payload: Optional[Dict[str, Any]] = None,
+) -> Optional[JobRow]:
+    logger.debug(
+        "DB enqueue_job_once started key=%s job_id=%s user_id=%s job_type=%s run_at=%s",
+        idempotency_key,
+        job_id,
+        user_id,
+        job_type,
+        run_at,
+    )
+    payload = payload or {}
+    try:
+        with open_db_connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO app.idempotency_keys (key, user_id, job_type, expires_at)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (key) DO NOTHING
+                        RETURNING key
+                        """,
+                        (idempotency_key, user_id, job_type, idempotency_expires_at),
+                    )
+                    idem_row = cur.fetchone()
+                    if idem_row is None:
+                        logger.debug(
+                            "DB enqueue_job_once skipped duplicate key=%s user_id=%s job_type=%s",
+                            idempotency_key,
+                            user_id,
+                            job_type,
+                        )
+                        return None
+
+                    cur.execute(
+                        """
+                        INSERT INTO app.jobs (
+                            id, user_id, job_type, run_at, status, payload
+                        )
+                        VALUES (%s, %s, %s, %s, 'queued', %s)
+                        RETURNING *
+                        """,
+                        (job_id, user_id, job_type, run_at, Json(payload)),
+                    )
+                    row = cur.fetchone()
+        if row is None:
+            raise RuntimeError("Failed to enqueue job")
+        logger.debug("DB enqueue_job_once done key=%s job_id=%s", idempotency_key, job_id)
+        return row
+    except Exception:
+        logger.exception(
+            "DB enqueue_job_once failed key=%s job_id=%s user_id=%s",
+            idempotency_key,
+            job_id,
+            user_id,
+        )
+        raise
+
+
 def enqueue_job(
     job_id: UUID,
     user_id: int,
@@ -402,6 +469,36 @@ def claim_runnable_jobs(worker_id: str, batch_size: int = 10) -> List[JobRow]:
         return rows
     except Exception:
         logger.exception("DB claim_runnable_jobs failed worker_id=%s", worker_id)
+        raise
+
+
+def requeue_stale_running_jobs(lease_seconds: int) -> int:
+    logger.debug("DB requeue_stale_running_jobs started lease_seconds=%s", lease_seconds)
+    try:
+        with open_db_connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE app.jobs
+                        SET
+                            status = 'queued',
+                            locked_by = NULL,
+                            locked_at = NULL,
+                            updated_at = NOW()
+                        WHERE status = 'running'
+                          AND locked_at IS NOT NULL
+                          AND locked_at < NOW() - (%s * INTERVAL '1 second')
+                        RETURNING id
+                        """,
+                        (lease_seconds,),
+                    )
+                    rows = cur.fetchall()
+        count = len(rows)
+        logger.debug("DB requeue_stale_running_jobs done requeued=%s", count)
+        return count
+    except Exception:
+        logger.exception("DB requeue_stale_running_jobs failed lease_seconds=%s", lease_seconds)
         raise
 
 

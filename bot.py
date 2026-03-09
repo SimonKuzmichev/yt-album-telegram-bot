@@ -21,7 +21,7 @@ from src.errors import is_auth_error, format_auth_help
 from src.db import (
     approve_user,
     block_user,
-    enqueue_job,
+    enqueue_job_once,
     ensure_user_settings,
     get_user_delivery_stats,
     get_user_settings,
@@ -29,7 +29,6 @@ from src.db import (
     list_pending_users,
     set_user_daily_time,
     set_user_timezone,
-    try_insert_idempotency_key,
     upsert_user,
 )
 from src.telegram_delivery import (
@@ -471,23 +470,20 @@ async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     idem_key = f"manual:{user['id']}:{request_id}"
 
     try:
-        created = try_insert_idempotency_key(
-            key=idem_key,
+        now_utc = datetime.now(timezone.utc)
+        row = enqueue_job_once(
+            idempotency_key=idem_key,
+            idempotency_expires_at=now_utc + timedelta(days=2),
+            job_id=uuid4(),
             user_id=user["id"],
             job_type=JOB_TYPE_DELIVER_NOW,
-            expires_at=datetime.now(timezone.utc) + timedelta(days=2),
+            run_at=now_utc,
+            payload={
+                "telegram_chat_id": chat_id,
+                "idempotency_key": idem_key,
+            },
         )
-        if created:
-            enqueue_job(
-                job_id=uuid4(),
-                user_id=user["id"],
-                job_type=JOB_TYPE_DELIVER_NOW,
-                run_at=datetime.now(timezone.utc),
-                payload={
-                    "telegram_chat_id": chat_id,
-                    "idempotency_key": idem_key,
-                },
-            )
+        if row is not None:
             logging.info(
                 "Queued deliver_now user_id=%s telegram_user_id=%s request_id=%s",
                 user["id"],
@@ -564,24 +560,21 @@ async def cmd_nextcycle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     request_id = get_request_id(update)
     idem_key = f"nextcycle:{user['id']}:{request_id}"
     try:
-        created = try_insert_idempotency_key(
-            key=idem_key,
+        now_utc = datetime.now(timezone.utc)
+        row = enqueue_job_once(
+            idempotency_key=idem_key,
+            idempotency_expires_at=now_utc + timedelta(days=2),
+            job_id=uuid4(),
             user_id=user["id"],
             job_type=JOB_TYPE_NEXT_CYCLE_NOW,
-            expires_at=datetime.now(timezone.utc) + timedelta(days=2),
+            run_at=now_utc,
+            payload={
+                "telegram_chat_id": chat_id,
+                "idempotency_key": idem_key,
+                "force_next_cycle": True,
+            },
         )
-        if created:
-            enqueue_job(
-                job_id=uuid4(),
-                user_id=user["id"],
-                job_type=JOB_TYPE_NEXT_CYCLE_NOW,
-                run_at=datetime.now(timezone.utc),
-                payload={
-                    "telegram_chat_id": chat_id,
-                    "idempotency_key": idem_key,
-                    "force_next_cycle": True,
-                },
-            )
+        if row is not None:
             logging.info(
                 "Queued next_cycle_now user_id=%s telegram_user_id=%s request_id=%s",
                 user["id"],

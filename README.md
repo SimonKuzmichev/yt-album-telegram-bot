@@ -49,6 +49,7 @@ Notes:
 - `ALLOWED_CHAT_ID` is only an admin override for admin-only commands such as `/approve`, `/block`, `/pending`, and `/refresh`.
 - Daily scheduling is executed by `worker.py` using per-user settings stored in the DB.
 - `DAILY_TIME` and `TZ` are still validated by `bot.py` at startup, but real daily delivery timing comes from DB user settings.
+- `WORKER_JOB_LEASE_SECONDS` controls when `running` jobs are considered stale and requeued after a worker crash.
 
 ## Setup
 
@@ -111,4 +112,5 @@ python3 sripts/get_chat_id.py
 
 - Empty library or refresh failures: verify `YTM_AUTH_PATH`, then run `python3 sripts/test_ytmusic.py`.
 - No daily deliveries: verify the worker is running and the user has valid DB timezone and daily time settings.
+- Jobs stuck in `running`: verify `WORKER_JOB_LEASE_SECONDS` is appropriate for normal job duration and that the worker loop is running.
 - Unauthorized admin actions: verify `ALLOWED_CHAT_ID`.

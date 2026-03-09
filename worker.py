@@ -12,14 +12,14 @@ from telegram import Bot
 
 from src.db import (
     claim_runnable_jobs,
-    enqueue_job,
+    enqueue_job_once,
     get_latest_cycle_number,
     insert_delivery_history,
     list_cycle_album_ids,
     list_active_users_with_settings,
     mark_job_failed,
     mark_job_succeeded,
-    try_insert_idempotency_key,
+    requeue_stale_running_jobs,
 )
 from src.library import get_albums_with_cache
 from src.telegram_delivery import send_album_message
@@ -42,6 +42,7 @@ class WorkerConfig:
     retry_backoff_base_seconds: int
     retry_backoff_max_seconds: int
     due_window_seconds: int
+    job_lease_seconds: int
 
 
 def _get_env_int(name: str, default: int) -> int:
@@ -94,6 +95,7 @@ def _load_worker_config() -> WorkerConfig:
         retry_backoff_base_seconds=_get_env_int("WORKER_RETRY_BACKOFF_BASE_SECONDS", 30),
         retry_backoff_max_seconds=_get_env_int("WORKER_RETRY_BACKOFF_MAX_SECONDS", 1800),
         due_window_seconds=_get_env_int("WORKER_DUE_WINDOW_SECONDS", 60),
+        job_lease_seconds=_get_env_int("WORKER_JOB_LEASE_SECONDS", 300),
     )
 
 
@@ -123,29 +125,24 @@ def enqueue_due_jobs(cfg: WorkerConfig) -> int:
             continue
 
         idem_key = _local_date_key(user_id, local_date_iso)
-        created = try_insert_idempotency_key(
-            key=idem_key,
-            user_id=user_id,
-            job_type=JOB_TYPE_DAILY_DELIVER,
-            expires_at=now_utc + timedelta(days=7),
-        )
-        if not created:
-            logging.debug("Skip enqueue: idempotency exists key=%s", idem_key)
-            continue
-
-        payload = {
-            "idempotency_key": idem_key,
-            "local_date": local_date_iso,
-            "timezone": timezone_name,
-            "telegram_chat_id": chat_id,
-        }
-        enqueue_job(
+        row = enqueue_job_once(
+            idempotency_key=idem_key,
+            idempotency_expires_at=now_utc + timedelta(days=7),
             job_id=uuid4(),
             user_id=user_id,
             job_type=JOB_TYPE_DAILY_DELIVER,
             run_at=now_utc,
-            payload=payload,
+            payload={
+                "idempotency_key": idem_key,
+                "local_date": local_date_iso,
+                "timezone": timezone_name,
+                "telegram_chat_id": chat_id,
+            },
         )
+        if row is None:
+            logging.debug("Skip enqueue: idempotency exists key=%s", idem_key)
+            continue
+
         enqueued_count += 1
         logging.info("Enqueued daily_deliver job user_id=%s key=%s", user_id, idem_key)
 
@@ -276,8 +273,11 @@ async def run_worker() -> None:
     while True:
         try:
             enqueued = enqueue_due_jobs(cfg)
+            requeued = requeue_stale_running_jobs(cfg.job_lease_seconds)
             processed = await process_claimed_jobs(bot, cfg)
-            logging.debug("Worker loop done enqueued=%s processed=%s", enqueued, processed)
+            if requeued:
+                logging.warning("Requeued stale running jobs count=%s lease_seconds=%s", requeued, cfg.job_lease_seconds)
+            logging.debug("Worker loop done enqueued=%s requeued=%s processed=%s", enqueued, requeued, processed)
         except Exception:
             logging.exception("Worker loop failed")
         await asyncio.sleep(cfg.poll_seconds)
