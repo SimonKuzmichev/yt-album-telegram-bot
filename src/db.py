@@ -26,22 +26,29 @@ def open_db_connection() -> psycopg.Connection:
     return psycopg.connect(get_database_url(), row_factory=dict_row)
 
 
-def _upsert_user_tx(conn: psycopg.Connection, telegram_user_id: int, telegram_chat_id: int) -> UserRow:
+def _upsert_user_tx(
+    conn: psycopg.Connection,
+    telegram_user_id: int,
+    telegram_chat_id: int,
+    username: Optional[str],
+) -> UserRow:
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO app.users (
                 telegram_user_id,
-                telegram_chat_id
+                telegram_chat_id,
+                username
             )
-            VALUES (%s, %s)
+            VALUES (%s, %s, %s)
             ON CONFLICT (telegram_user_id)
             DO UPDATE SET
                 telegram_chat_id = EXCLUDED.telegram_chat_id,
+                username = EXCLUDED.username,
                 updated_at = NOW()
             RETURNING id, allowlisted, status
             """,
-            (telegram_user_id, telegram_chat_id),
+            (telegram_user_id, telegram_chat_id, username),
         )
         #TODO: check the return later
         row = cur.fetchone()
@@ -72,7 +79,7 @@ def _set_user_access_tx(
         return cur.fetchone()
 
 
-def upsert_user(telegram_user_id: int, telegram_chat_id: int) -> UserRow:
+def upsert_user(telegram_user_id: int, telegram_chat_id: int, username: Optional[str] = None) -> UserRow:
     logger.debug(
         "DB upsert_user started telegram_user_id=%s telegram_chat_id=%s",
         telegram_user_id,
@@ -85,6 +92,7 @@ def upsert_user(telegram_user_id: int, telegram_chat_id: int) -> UserRow:
                     conn=conn,
                     telegram_user_id=telegram_user_id,
                     telegram_chat_id=telegram_chat_id,
+                    username=username,
                 )
         logger.debug(
             "DB upsert_user done user_id=%s allowlisted=%s status=%s",
@@ -166,7 +174,7 @@ def list_pending_users(limit: int = 20) -> List[UserRow]:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
-                        SELECT id, telegram_user_id, telegram_chat_id, allowlisted, status, created_at
+                        SELECT id, telegram_user_id, telegram_chat_id, allowlisted, status, created_at, username
                         FROM app.users
                         WHERE status = 'pending'
                         ORDER BY created_at DESC
@@ -474,62 +482,79 @@ def mark_job_failed(job_id: UUID, error_text: str, next_run_at: datetime) -> Job
         raise
 
 
-def insert_delivery_history(user_id: int, cycle_id: UUID, album_id: str) -> bool:
-    logger.debug("DB insert_delivery_history started user_id=%s cycle_id=%s album_id=%s", user_id, cycle_id, album_id)
+def insert_delivery_history(user_id: int, cycle_number: int, album_id: str) -> bool:
+    logger.debug(
+        "DB insert_delivery_history started user_id=%s cycle_number=%s album_id=%s",
+        user_id,
+        cycle_number,
+        album_id,
+    )
     try:
         with open_db_connection() as conn:
             with conn.transaction():
                 with conn.cursor() as cur:
                     cur.execute(
                         """
-                        INSERT INTO app.delivery_history (user_id, cycle_id, album_id)
+                        INSERT INTO app.delivery_history (user_id, cycle_number, album_id)
                         VALUES (%s, %s, %s)
                         ON CONFLICT DO NOTHING
                         RETURNING id
                         """,
-                        (user_id, cycle_id, album_id),
+                        (user_id, cycle_number, album_id),
                     )
                     row = cur.fetchone()
         inserted = row is not None
         logger.debug(
-            "DB insert_delivery_history done user_id=%s cycle_id=%s inserted=%s",
+            "DB insert_delivery_history done user_id=%s cycle_number=%s inserted=%s",
             user_id,
-            cycle_id,
+            cycle_number,
             inserted,
         )
         return inserted
     except Exception:
-        logger.exception("DB insert_delivery_history failed user_id=%s cycle_id=%s", user_id, cycle_id)
+        logger.exception(
+            "DB insert_delivery_history failed user_id=%s cycle_number=%s",
+            user_id,
+            cycle_number,
+        )
         raise
 
 
-def get_latest_cycle_id(user_id: int) -> Optional[UUID]:
-    logger.debug("DB get_latest_cycle_id started user_id=%s", user_id)
+def get_latest_cycle_number(user_id: int) -> Optional[int]:
+    logger.debug("DB get_latest_cycle_number started user_id=%s", user_id)
     try:
         with open_db_connection() as conn:
             with conn.transaction():
                 with conn.cursor() as cur:
                     cur.execute(
                         """
-                        SELECT cycle_id
+                        SELECT cycle_number
                         FROM app.delivery_history
                         WHERE user_id = %s
-                        ORDER BY delivered_at DESC, id DESC
+                        ORDER BY cycle_number DESC, delivered_at DESC, id DESC
                         LIMIT 1
                         """,
                         (user_id,),
                     )
                     row = cur.fetchone()
-        cycle_id = row["cycle_id"] if row else None
-        logger.debug("DB get_latest_cycle_id done user_id=%s cycle_id=%s", user_id, cycle_id)
-        return cycle_id
+        cycle_number = int(row["cycle_number"]) if row else None
+        logger.debug(
+            "DB get_latest_cycle_number done user_id=%s cycle_number=%s",
+            user_id,
+            cycle_number,
+        )
+        return cycle_number
     except Exception:
-        logger.exception("DB get_latest_cycle_id failed user_id=%s", user_id)
+        logger.exception("DB get_latest_cycle_number failed user_id=%s", user_id)
         raise
 
 
-def list_cycle_album_ids(user_id: int, cycle_id: UUID) -> List[str]:
-    logger.debug("DB list_cycle_album_ids started user_id=%s cycle_id=%s", user_id, cycle_id)
+def list_cycle_album_ids(user_id: int, cycle_number: int) -> List[str]:
+    logger.debug(
+        "DB list_cycle_album_ids started user_id=%s cycle_number=%s",
+        user_id,
+        cycle_number,
+    )
     try:
         with open_db_connection() as conn:
             with conn.transaction():
@@ -539,21 +564,25 @@ def list_cycle_album_ids(user_id: int, cycle_id: UUID) -> List[str]:
                         SELECT album_id
                         FROM app.delivery_history
                         WHERE user_id = %s
-                          AND cycle_id = %s
+                          AND cycle_number = %s
                         """,
-                        (user_id, cycle_id),
+                        (user_id, cycle_number),
                     )
                     rows = cur.fetchall()
         album_ids = [str(r["album_id"]) for r in rows if r.get("album_id")]
         logger.debug(
-            "DB list_cycle_album_ids done user_id=%s cycle_id=%s count=%s",
+            "DB list_cycle_album_ids done user_id=%s cycle_number=%s count=%s",
             user_id,
-            cycle_id,
+            cycle_number,
             len(album_ids),
         )
         return album_ids
     except Exception:
-        logger.exception("DB list_cycle_album_ids failed user_id=%s cycle_id=%s", user_id, cycle_id)
+        logger.exception(
+            "DB list_cycle_album_ids failed user_id=%s cycle_number=%s",
+            user_id,
+            cycle_number,
+        )
         raise
 
 
@@ -567,7 +596,6 @@ def get_user_delivery_stats(user_id: int) -> UserRow:
                         """
                         SELECT
                             COUNT(*)::BIGINT AS total_deliveries,
-                            COUNT(DISTINCT cycle_id)::BIGINT AS cycle_count,
                             MAX(delivered_at) AS last_delivered_at
                         FROM app.delivery_history
                         WHERE user_id = %s
@@ -578,36 +606,35 @@ def get_user_delivery_stats(user_id: int) -> UserRow:
 
                     cur.execute(
                         """
-                        SELECT cycle_id
+                        SELECT cycle_number
                         FROM app.delivery_history
                         WHERE user_id = %s
-                        ORDER BY delivered_at DESC, id DESC
+                        ORDER BY cycle_number DESC, delivered_at DESC, id DESC
                         LIMIT 1
                         """,
                         (user_id,),
                     )
                     latest = cur.fetchone()
-                    latest_cycle_id = latest["cycle_id"] if latest else None
+                    latest_cycle_number = int(latest["cycle_number"]) if latest else None
 
                     latest_cycle_count = 0
-                    if latest_cycle_id is not None:
+                    if latest_cycle_number is not None:
                         cur.execute(
                             """
                             SELECT COUNT(*)::BIGINT AS cnt
                             FROM app.delivery_history
                             WHERE user_id = %s
-                              AND cycle_id = %s
+                              AND cycle_number = %s
                             """,
-                            (user_id, latest_cycle_id),
+                            (user_id, latest_cycle_number),
                         )
                         count_row = cur.fetchone() or {}
                         latest_cycle_count = int(count_row.get("cnt") or 0)
 
         result = {
             "total_deliveries": int((summary or {}).get("total_deliveries") or 0),
-            "cycle_count": int((summary or {}).get("cycle_count") or 0),
             "last_delivered_at": (summary or {}).get("last_delivered_at"),
-            "latest_cycle_id": latest_cycle_id,
+            "latest_cycle_number": latest_cycle_number,
             "latest_cycle_count": latest_cycle_count,
         }
         logger.debug("DB get_user_delivery_stats done user_id=%s total=%s", user_id, result["total_deliveries"])
@@ -625,7 +652,7 @@ def list_recent_deliveries(user_id: int, limit: int = 5) -> List[UserRow]:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
-                        SELECT album_id, cycle_id, delivered_at
+                        SELECT album_id, cycle_number, delivered_at
                         FROM app.delivery_history
                         WHERE user_id = %s
                         ORDER BY delivered_at DESC, id DESC

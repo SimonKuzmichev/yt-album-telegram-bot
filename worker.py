@@ -13,7 +13,7 @@ from telegram import Bot
 from src.db import (
     claim_runnable_jobs,
     enqueue_job,
-    get_latest_cycle_id,
+    get_latest_cycle_number,
     insert_delivery_history,
     list_cycle_album_ids,
     list_active_users_with_settings,
@@ -27,6 +27,7 @@ from src.telegram_delivery import send_album_message
 
 JOB_TYPE_DAILY_DELIVER = "daily_deliver"
 JOB_TYPE_DELIVER_NOW = "deliver_now"
+JOB_TYPE_NEXT_CYCLE_NOW = "next_cycle_now"
 
 
 @dataclass(frozen=True)
@@ -156,6 +157,7 @@ async def _execute_delivery_job(bot: Bot, cfg: WorkerConfig, job: dict) -> None:
     user_id = int(job["user_id"])
     chat_id = int(payload["telegram_chat_id"])
     job_type = str(job["job_type"])
+    force_next_cycle = bool(payload.get("force_next_cycle")) or job_type == JOB_TYPE_NEXT_CYCLE_NOW
 
     albums = get_albums_with_cache(
         auth_path=cfg.auth_path,
@@ -167,18 +169,17 @@ async def _execute_delivery_job(bot: Bot, cfg: WorkerConfig, job: dict) -> None:
         raise RuntimeError("Library is empty")
 
     # Cycle semantics:
-    # - keep current cycle_id until all eligible albums are delivered to the user
-    # - only then rotate to a new cycle_id
-    current_cycle_id = get_latest_cycle_id(user_id)
-    if current_cycle_id is None:
-        current_cycle_id = uuid4()
+    # - default: keep current cycle_number until exhausted, then rotate
+    # - force_next_cycle: immediately transition to next cycle_number
+    latest_cycle_number = get_latest_cycle_number(user_id) or 0
+    current_cycle_number = (latest_cycle_number + 1) if force_next_cycle else max(latest_cycle_number, 1)
 
     eligible = [a for a in albums if a.get("browseId")]
-    delivered_ids = set(list_cycle_album_ids(user_id=user_id, cycle_id=current_cycle_id))
+    delivered_ids = set(list_cycle_album_ids(user_id=user_id, cycle_number=current_cycle_number))
     unsent = [a for a in eligible if str(a.get("browseId")) not in delivered_ids]
 
-    if not unsent:
-        current_cycle_id = uuid4()
+    if not unsent and not force_next_cycle:
+        current_cycle_number += 1
         unsent = eligible
 
     if not unsent:
@@ -193,7 +194,7 @@ async def _execute_delivery_job(bot: Bot, cfg: WorkerConfig, job: dict) -> None:
     # worker first, retry with remaining unsent candidates.
     reserved = insert_delivery_history(
         user_id=user_id,
-        cycle_id=current_cycle_id,
+        cycle_number=current_cycle_number,
         album_id=selected_album_id,
     )
     if not reserved:
@@ -203,7 +204,11 @@ async def _execute_delivery_job(bot: Bot, cfg: WorkerConfig, job: dict) -> None:
             candidate_id = str(candidate.get("browseId") or "")
             if not candidate_id:
                 continue
-            if insert_delivery_history(user_id=user_id, cycle_id=current_cycle_id, album_id=candidate_id):
+            if insert_delivery_history(
+                user_id=user_id,
+                cycle_number=current_cycle_number,
+                album_id=candidate_id,
+            ):
                 selected_album = candidate
                 reserved = True
                 break
@@ -211,7 +216,12 @@ async def _execute_delivery_job(bot: Bot, cfg: WorkerConfig, job: dict) -> None:
     if not reserved:
         raise RuntimeError("Could not reserve a unique album in current cycle")
 
-    prefix = "📅 Daily album" if job_type == JOB_TYPE_DAILY_DELIVER else "🎲 Album now"
+    if job_type == JOB_TYPE_DAILY_DELIVER:
+        prefix = "📅 Daily album"
+    elif force_next_cycle:
+        prefix = "⏭️ New cycle album"
+    else:
+        prefix = "🎲 Album now"
     await send_album_message(bot, chat_id=chat_id, album=selected_album, prefix=prefix)
 
 
@@ -227,7 +237,7 @@ async def process_claimed_jobs(bot: Bot, cfg: WorkerConfig) -> int:
         idem_key = payload.get("idempotency_key")
 
         try:
-            if job_type not in {JOB_TYPE_DAILY_DELIVER, JOB_TYPE_DELIVER_NOW}:
+            if job_type not in {JOB_TYPE_DAILY_DELIVER, JOB_TYPE_DELIVER_NOW, JOB_TYPE_NEXT_CYCLE_NOW}:
                 raise RuntimeError(f"Unsupported job_type: {job_type}")
 
             await _execute_delivery_job(bot, cfg, job)

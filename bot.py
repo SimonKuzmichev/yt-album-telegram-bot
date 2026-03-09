@@ -46,6 +46,7 @@ from src.telegram_delivery import (
 
 Album = Dict[str, Any]
 JOB_TYPE_DELIVER_NOW = "deliver_now"
+JOB_TYPE_NEXT_CYCLE_NOW = "next_cycle_now"
 
 def album_log_summary(album: Album) -> str:
     title = str(album.get("title") or "").strip() or "n/a"
@@ -167,6 +168,7 @@ def register_user_from_update(update: Update) -> Optional[Dict[str, Any]]:
     user = upsert_user(
         telegram_user_id=update.effective_user.id,
         telegram_chat_id=update.effective_chat.id,
+        username=update.effective_user.username,
     )
     ensure_user_settings(user["id"])
     return user
@@ -412,7 +414,7 @@ async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     lines = ["Pending users (latest 20):"]
     for row in rows:
         lines.append(
-            f"- {row['telegram_user_id']} chat={row['telegram_chat_id']} created={row['created_at']}"
+            f"- {row['telegram_user_id']} chat={row['telegram_chat_id']} created={row['created_at']} username={row['username']}"
         )
     await reply(update, context, "\n".join(lines))
 
@@ -513,7 +515,6 @@ async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 run_at=datetime.now(timezone.utc),
                 payload={
                     "telegram_chat_id": chat_id,
-                    "request_id": request_id,
                     "idempotency_key": idem_key,
                 },
             )
@@ -577,6 +578,59 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         logging.warning("Library refresh returned empty album list source=command")
     await reply(update, context, f"✅ Refreshed. Cached albums: {len(albums)}", reply_markup=build_keyboard(None))
 
+
+async def cmd_nextcycle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = await require_allowlisted_user(update, context, "nextcycle")
+    if user is None:
+        return
+    chat_id = get_update_chat_id(update)
+    if chat_id is None:
+        return
+    if not await enforce_cooldown(update, context, "nextcycle"):
+        return
+
+    user_id = update.effective_user.id if update.effective_user else None
+    logging.info("Command /nextcycle chat_id=%s user_id=%s", chat_id, user_id)
+    request_id = get_request_id(update)
+    idem_key = f"nextcycle:{user['id']}:{request_id}"
+    try:
+        created = try_insert_idempotency_key(
+            key=idem_key,
+            user_id=user["id"],
+            job_type=JOB_TYPE_NEXT_CYCLE_NOW,
+            expires_at=datetime.now(timezone.utc) + timedelta(days=2),
+        )
+        if created:
+            enqueue_job(
+                job_id=uuid4(),
+                user_id=user["id"],
+                job_type=JOB_TYPE_NEXT_CYCLE_NOW,
+                run_at=datetime.now(timezone.utc),
+                payload={
+                    "telegram_chat_id": chat_id,
+                    "idempotency_key": idem_key,
+                    "force_next_cycle": True,
+                },
+            )
+            logging.info(
+                "Queued next_cycle_now user_id=%s telegram_user_id=%s request_id=%s",
+                user["id"],
+                user_id,
+                request_id,
+            )
+            await reply(update, context, "Queued ✅ New cycle album will arrive soon")
+        else:
+            logging.info(
+                "Skipped duplicate next_cycle_now enqueue user_id=%s telegram_user_id=%s request_id=%s",
+                user["id"],
+                user_id,
+                request_id,
+            )
+            await reply(update, context, "Expect the previous new-cycle album to arrive soon 🙂")
+    except Exception as e:
+        await notify_error(context, chat_id, "Failed to queue /nextcycle delivery", e)
+        return
+
 def _fmt_ts(ts: Optional[Any], tz: ZoneInfo) -> str:
     if not ts:
         return "n/a"
@@ -630,8 +684,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"Timezone: {settings.get('timezone')}",
         f"Daily time: {settings.get('daily_time_local')}",
         f"DB deliveries total: {db_stats.get('total_deliveries')}",
-        f"DB cycles: {db_stats.get('cycle_count')}",
-        f"DB latest cycle: {db_stats.get('latest_cycle_id') or 'n/a'}",
+        f"DB latest cycle: {db_stats.get('latest_cycle_number') or 'n/a'}",
         f"DB sent in latest cycle: {db_stats.get('latest_cycle_count')}",
         f"DB last delivered: {_fmt_ts(db_stats.get('last_delivered_at'), tz)}",
         "",
@@ -640,7 +693,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if recent_deliveries:
         for row in recent_deliveries:
             msg_lines.append(
-                f"- {_fmt_ts(row.get('delivered_at'), tz)} album={row.get('album_id')} cycle={row.get('cycle_id')}"
+                f"- {_fmt_ts(row.get('delivered_at'), tz)} album={row.get('album_id')} cycle={row.get('cycle_number')}"
             )
     else:
         msg_lines.append("- none")
@@ -792,6 +845,7 @@ def main() -> None:
     app.add_handler(CommandHandler("settz", cmd_settz))
     app.add_handler(CommandHandler("settime", cmd_settime))
     app.add_handler(CommandHandler("now", cmd_now))
+    app.add_handler(CommandHandler("nextcycle", cmd_nextcycle))
     app.add_handler(CommandHandler("refresh", cmd_refresh))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_error_handler(on_error)
