@@ -197,6 +197,64 @@ class JobIntegrationTests(PostgresIntegrationTestCase):
         self.assertEqual(jobs_row["cnt"], 1)
         self.assertEqual(idem_row["cnt"], 1)
 
+    def test_enqueue_job_once_rolls_back_idempotency_key_when_job_insert_fails(self) -> None:
+        user_id = self.create_user(telegram_user_id=1150, telegram_chat_id=2150, username="idem")
+        existing_job_id = uuid4()
+        idempotency_key = f"manual:{user_id}:rollback-check"
+
+        db.enqueue_job(
+            job_id=existing_job_id,
+            user_id=user_id,
+            job_type="deliver_now",
+            run_at=datetime.now(timezone.utc),
+            payload={"telegram_chat_id": 2150},
+        )
+
+        with self.assertRaises(Exception):
+            db.enqueue_job_once(
+                idempotency_key=idempotency_key,
+                idempotency_expires_at=datetime.now(timezone.utc) + timedelta(days=1),
+                job_id=existing_job_id,
+                user_id=user_id,
+                job_type="deliver_now",
+                run_at=datetime.now(timezone.utc),
+                payload={"telegram_chat_id": 2150},
+            )
+
+        idem_row = self.query_one(
+            "SELECT COUNT(*)::INT AS cnt FROM app.idempotency_keys WHERE key = %s",
+            (idempotency_key,),
+        )
+        jobs_row = self.query_one(
+            "SELECT COUNT(*)::INT AS cnt FROM app.jobs WHERE user_id = %s",
+            (user_id,),
+        )
+
+        retry_row = db.enqueue_job_once(
+            idempotency_key=idempotency_key,
+            idempotency_expires_at=datetime.now(timezone.utc) + timedelta(days=1),
+            job_id=uuid4(),
+            user_id=user_id,
+            job_type="deliver_now",
+            run_at=datetime.now(timezone.utc),
+            payload={"telegram_chat_id": 2150},
+        )
+
+        idem_row_after_retry = self.query_one(
+            "SELECT COUNT(*)::INT AS cnt FROM app.idempotency_keys WHERE key = %s",
+            (idempotency_key,),
+        )
+        jobs_row_after_retry = self.query_one(
+            "SELECT COUNT(*)::INT AS cnt FROM app.jobs WHERE user_id = %s",
+            (user_id,),
+        )
+
+        self.assertEqual(idem_row["cnt"], 0)
+        self.assertEqual(jobs_row["cnt"], 1)
+        self.assertIsNotNone(retry_row)
+        self.assertEqual(idem_row_after_retry["cnt"], 1)
+        self.assertEqual(jobs_row_after_retry["cnt"], 2)
+
     def test_claiming_runnable_jobs_does_not_return_same_job_twice(self) -> None:
         user_id = self.create_user(telegram_user_id=1200, telegram_chat_id=2200, username="claim")
         job = db.enqueue_job(
