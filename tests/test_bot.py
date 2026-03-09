@@ -10,7 +10,7 @@ from tests.support import install_module_stubs
 
 install_module_stubs()
 
-from bot import (
+from bot import (  # noqa: E402
     _fmt_ts,
     _is_admin_override_chat,
     get_optional_env_int,

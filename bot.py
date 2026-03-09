@@ -39,7 +39,6 @@ from src.telegram_delivery import (
     CB_REFRESH,
     CB_STATUS,
     build_keyboard,
-    send_album_message,
 )
 
 
@@ -566,7 +565,6 @@ async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await enforce_cooldown(update, context, "now"):
         return
 
-    user_id = update.effective_user.id if update.effective_user else None
     _log_bot_event("command_now", user_id=user["id"], telegram_chat_id=chat_id)
     request_id = get_request_id(update)
     idem_key = f"manual:{user['id']}:{request_id}"
@@ -673,7 +671,6 @@ async def cmd_nextcycle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not await enforce_cooldown(update, context, "nextcycle"):
         return
 
-    user_id = update.effective_user.id if update.effective_user else None
     _log_bot_event("command_nextcycle", user_id=user["id"], telegram_chat_id=chat_id)
     request_id = get_request_id(update)
     idem_key = f"nextcycle:{user['id']}:{request_id}"
@@ -746,7 +743,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if chat_id is None:
         return
 
-    user_id = update.effective_user.id if update.effective_user else None
     _log_bot_event("command_status", user_id=user["id"], telegram_chat_id=chat_id)
 
     cache_path = context.application.bot_data["cache_path"]
@@ -819,7 +815,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     chat_id = get_update_chat_id(update)
     if chat_id is None:
         return
-    user_id = update.effective_user.id if update.effective_user else None
     _log_bot_event(
         "callback_received",
         message=f"callback_received action={data}",

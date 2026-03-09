@@ -7,7 +7,7 @@ from tests.support import install_module_stubs
 
 install_module_stubs()
 
-from worker import (
+from worker import (  # noqa: E402
     _compute_backoff_seconds,
     _get_env_int,
     _get_env_str,
