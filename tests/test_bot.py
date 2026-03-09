@@ -110,6 +110,10 @@ class FmtTsTests(unittest.TestCase):
     def test_returns_na_for_missing_timestamp(self) -> None:
         self.assertEqual(_fmt_ts(None, ZoneInfo("UTC")), "n/a")
 
+    def test_formats_unix_epoch_timestamp_in_target_timezone(self) -> None:
+        formatted = _fmt_ts(1773036000, ZoneInfo("Europe/Riga"))
+        self.assertEqual(formatted, "2026-03-09 08:00:00 EET")
+
     def test_formats_timestamp_in_target_timezone(self) -> None:
         ts = datetime(2026, 3, 9, 6, 0, tzinfo=timezone.utc)
         formatted = _fmt_ts(ts, ZoneInfo("Europe/Riga"))

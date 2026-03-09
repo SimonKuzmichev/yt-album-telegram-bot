@@ -718,6 +718,17 @@ async def cmd_nextcycle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 def _fmt_ts(ts: Optional[Any], tz: ZoneInfo) -> str:
     if not ts:
         return "n/a"
+    if isinstance(ts, (int, float)):
+        ts = datetime.fromtimestamp(ts, tz=timezone.utc)
+    elif isinstance(ts, str):
+        try:
+            ts = datetime.fromisoformat(ts)
+        except ValueError:
+            return ts
+    if not isinstance(ts, datetime):
+        return str(ts)
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
     dt = ts.astimezone(tz)
     return dt.strftime("%Y-%m-%d %H:%M:%S %Z")
 
