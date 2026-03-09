@@ -60,6 +60,10 @@ docker compose up -d db
 ```
 
 2. Apply migrations.
+```bash
+alembic upgrade head
+```
+
 3. Start the bot process.
 4. Start the worker process.
 
@@ -67,11 +71,13 @@ Example:
 
 ```bash
 source .venv/bin/activate
+pip install -r requirements.txt
 python3 bot.py
 ```
 
 ```bash
 source .venv/bin/activate
+pip install -r requirements.txt
 python3 worker.py
 ```
 

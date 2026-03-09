@@ -1,5 +1,7 @@
+alembic==1.18.4
 python-dotenv==1.2.2
 python-telegram-bot[job-queue,socks]==22.6
 ytmusicapi==1.11.5
 requests[socks]==2.32.5
-psycopg[binary,pool]
+ruff==0.15.5
+psycopg[binary,pool]==3.3.3
