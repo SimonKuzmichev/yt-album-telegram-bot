@@ -2,7 +2,6 @@ import asyncio
 import logging
 import os
 from datetime import datetime, time as dt_time, timedelta, timezone
-from time import perf_counter
 from uuid import NAMESPACE_URL, uuid4, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Any, Dict, Optional
@@ -17,9 +16,7 @@ from telegram.ext import (
     Defaults,
 )
 
-from src.history import load_history, history_count
 from src.library import get_albums_with_cache, load_cache_payload
-from src.picker import pick_random_album_no_repeat
 from src.errors import is_auth_error, format_auth_help
 from src.db import (
     approve_user,
@@ -47,12 +44,6 @@ from src.telegram_delivery import (
 Album = Dict[str, Any]
 JOB_TYPE_DELIVER_NOW = "deliver_now"
 JOB_TYPE_NEXT_CYCLE_NOW = "next_cycle_now"
-
-def album_log_summary(album: Album) -> str:
-    title = str(album.get("title") or "").strip() or "n/a"
-    artist = str(album.get("artist") or "").strip() or "n/a"
-    browse_id = str(album.get("browseId") or "").strip() or "n/a"
-    return f"artist={artist!r} title={title!r} browseId={browse_id!r}"
 
 def is_cooled_down(app: Application, min_seconds: float = 2.0) -> bool:
     # Global callback throttle: one shared timestamp in app.bot_data for the whole bot
@@ -85,15 +76,6 @@ async def enforce_cooldown(
         await reply(update, context, "Too fast 🙂")
     return False
 
-async def send_album(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    album: Album,
-    prefix: Optional[str] = None,
-) -> None:
-    await send_album_message(context.bot, chat_id=chat_id, album=album, prefix=prefix)
-
-
 def parse_daily_time(value: str) -> dt_time:
     # Parse HH:MM into datetime.time.
     parts = value.strip().split(":")
@@ -120,18 +102,6 @@ def get_optional_env_int(name: str) -> Optional[int]:
     if v is None or not v.strip():
         return None
     return int(v)
-
-
-def get_env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None or not raw.strip():
-        return default
-    normalized = raw.strip().lower()
-    if normalized in {"1", "true", "yes", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "off"}:
-        return False
-    raise RuntimeError(f"{name} must be true/false (got: {raw})")
 
 
 def get_update_chat_id(update: Update) -> Optional[int]:
@@ -634,12 +604,7 @@ async def cmd_nextcycle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 def _fmt_ts(ts: Optional[Any], tz: ZoneInfo) -> str:
     if not ts:
         return "n/a"
-    if isinstance(ts, datetime):
-        # DB timestamps come as datetime objects from psycopg.
-        dt = ts.astimezone(tz)
-    else:
-        # Local JSON cache/history stores epoch seconds.
-        dt = datetime.fromtimestamp(int(ts), tz=tz)
+    dt = ts.astimezone(tz)
     return dt.strftime("%Y-%m-%d %H:%M:%S %Z")
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -654,7 +619,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     logging.info("Command /status chat_id=%s user_id=%s", chat_id, user_id)
 
     cache_path = context.application.bot_data["cache_path"]
-    history_path = context.application.bot_data["history_path"]
     tz = context.application.bot_data["tz"]
     try:
         settings = get_user_settings(user["id"])
@@ -668,13 +632,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     albums = cache_payload.get("albums") or []
     cache_updated = cache_payload.get("updated_at")
 
-    history = load_history(history_path)
-    sent_n = history_count(history)
-    hist_updated = history.get("updated_at")
-
     total = len(albums)
-    remaining = max(total - sent_n, 0)
-    logging.info("Status snapshot cached_albums=%s sent=%s remaining=%s", total, sent_n, remaining)
+    logging.info("Status snapshot cached_albums=%s", total)
     if total == 0:
         logging.warning("Status shows empty cached library")
 
@@ -698,17 +657,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     else:
         msg_lines.append("- none")
 
-    msg_lines.extend(
-        [
-            "",
-            "Legacy local cache/history:",
-            f"Cached albums: {total}",
-            f"Sent in local file cycle: {sent_n}",
-            f"Remaining (local estimate): {remaining}",
-            f"Cache updated: {_fmt_ts(cache_updated, tz)}",
-            f"History updated: {_fmt_ts(hist_updated, tz)}",
-        ]
-    )
+    msg_lines.extend(["", "Local cache:", f"Cached albums: {total}", f"Cache updated: {_fmt_ts(cache_updated, tz)}"])
 
     await reply(update, context, "\n".join(msg_lines), reply_markup=build_keyboard(None))
 
@@ -746,44 +695,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
 
-async def daily_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Temporary compatibility path: if ALLOWED_CHAT_ID is set, daily job can still
-    # send there while allowlist-driven scheduling is not implemented yet.
-    admin_chat_id_override = context.application.bot_data["admin_chat_id_override"]
-    if admin_chat_id_override is None:
-        logging.info("Daily job skipped: ALLOWED_CHAT_ID admin override is not set")
-        return
-
-    auth_path = context.application.bot_data["auth_path"]
-    cache_path = context.application.bot_data["cache_path"]
-    history_path = context.application.bot_data["history_path"]
-    limit = context.application.bot_data["library_limit"]
-
-    logging.info("Daily job started chat_id=%s", admin_chat_id_override)
-    started_at = perf_counter()
-    try:
-        album, refreshed = pick_random_album_no_repeat(
-            auth_path=auth_path,
-            cache_path=cache_path,
-            history_path=history_path,
-            library_limit=limit,
-        )
-    except Exception as e:
-        await notify_error(context, admin_chat_id_override, "Daily job failed (cannot pick album)", e)
-        return
-
-    elapsed_ms = int((perf_counter() - started_at) * 1000)
-    logging.info(
-        "Daily job picked album refreshed=%s elapsed_ms=%s %s",
-        refreshed,
-        elapsed_ms,
-        album_log_summary(album),
-    )
-    prefix = "🔄 Library refreshed (cycle restarted)" if refreshed else "📅 Daily album"
-    await send_album(context, admin_chat_id_override, album, prefix=prefix)
-    logging.info("Daily job message sent chat_id=%s", admin_chat_id_override)
-
-
 def main() -> None:
     load_dotenv()
 
@@ -797,14 +708,10 @@ def main() -> None:
     tz = ZoneInfo(tz_name)
 
     daily_time_str = os.getenv("DAILY_TIME", "09:30")
-    daily_time = parse_daily_time(daily_time_str)
-    daily_time = daily_time.replace(tzinfo=tz)
-    use_db_scheduler = get_env_bool("USE_DB_SCHEDULER", True)
+    parse_daily_time(daily_time_str)
 
-    # Paths & limits (tweakable without code changes if you want later)
     auth_path = os.getenv("YTM_AUTH_PATH", "secrets/browser.json")
     cache_path = os.getenv("ALBUM_CACHE_PATH", "data/albums_cache.json")
-    history_path = os.getenv("HISTORY_PATH", "data/sent_history.json")
     library_limit = int(os.getenv("LIBRARY_LIMIT", "500"))
     log_level_name = os.getenv("LOG_LEVEL", "INFO").strip().upper()
     log_level = getattr(logging, log_level_name, None)
@@ -818,12 +725,11 @@ def main() -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.info(
-        "Bot startup TZ=%s DAILY_TIME=%s LIBRARY_LIMIT=%s ALLOWED_CHAT_ID=%s USE_DB_SCHEDULER=%s",
+        "Bot startup TZ=%s DAILY_TIME=%s LIBRARY_LIMIT=%s ALLOWED_CHAT_ID=%s",
         tz_name,
         daily_time_str,
         library_limit,
         admin_chat_id_override,
-        use_db_scheduler,
     )
 
     app = Application.builder().token(token).defaults(Defaults(tzinfo=tz)).build()
@@ -832,7 +738,6 @@ def main() -> None:
     app.bot_data["admin_chat_id_override"] = admin_chat_id_override
     app.bot_data["auth_path"] = auth_path
     app.bot_data["cache_path"] = cache_path
-    app.bot_data["history_path"] = history_path
     app.bot_data["library_limit"] = library_limit
     app.bot_data["tz"] = tz
     app.bot_data["cooldown"] = {"last_ts": 0.0}
@@ -852,21 +757,6 @@ def main() -> None:
 
     # Buttons (callback queries)
     app.add_handler(CallbackQueryHandler(on_callback))
-
-    if use_db_scheduler:
-        logging.info("DB scheduler enabled: in-process daily JobQueue is disabled")
-    else:
-        # Daily scheduled job in local timezone (legacy path).
-        app.job_queue.run_daily(
-            daily_job,
-            time=daily_time,
-            days=(0, 1, 2, 3, 4, 5, 6),
-            name="daily_album_job",
-            # misfire_grace_time: run late jobs if startup delay is <=120s.
-            # coalesce: merge missed runs into one execution after downtime.
-            # max_instances: prevent overlapping daily_job runs.
-            job_kwargs={"misfire_grace_time": 120, "coalesce": True, "max_instances": 1},
-        )
 
     # Start polling (no public IP required)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
