@@ -16,10 +16,8 @@ from telegram.ext import (
     Defaults,
 )
 
-from src.library import load_cache_payload
 from src.errors import is_auth_error, format_auth_help
 from src.logging_utils import configure_logging, log_event
-from src.providers import build_provider_client
 from src.db import (
     approve_user,
     block_user,
@@ -749,9 +747,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     _log_bot_event("command_status", user_id=user["id"], telegram_chat_id=chat_id)
 
-    cache_path = context.application.bot_data["cache_path"]
     tz = context.application.bot_data["tz"]
     try:
+        provider_account = get_active_user_provider_account(user["id"])
         settings = get_user_settings(user["id"])
         db_stats = get_user_delivery_stats(user["id"])
         recent_deliveries = list_recent_deliveries(user["id"], limit=5)
@@ -759,30 +757,20 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await notify_error(context, chat_id, "Failed to load DB status", e)
         return
 
-    cache_payload = load_cache_payload(cache_path) or {}
-    albums = cache_payload.get("albums") or []
-    cache_updated = cache_payload.get("updated_at")
-
-    total = len(albums)
     _log_bot_event(
         "status_snapshot",
-        message=f"status_snapshot cached_albums={total}",
+        message="status_snapshot",
         user_id=user["id"],
         telegram_chat_id=chat_id,
     )
-    if total == 0:
-        _log_bot_event(
-            "status_empty_cache",
-            level=logging.WARNING,
-            user_id=user["id"],
-            telegram_chat_id=chat_id,
-        )
 
     msg_lines = [
         "DB user:",
         f"Access: allowlisted={user.get('allowlisted')} status={user.get('status')}",
         f"Timezone: {settings.get('timezone')}",
         f"Daily time: {settings.get('daily_time_local')}",
+        f"Active provider: {(provider_account or {}).get('provider') or 'n/a'}",
+        f"Provider status: {(provider_account or {}).get('status') or 'n/a'}",
         f"DB deliveries total: {db_stats.get('total_deliveries')}",
         f"DB latest cycle: {db_stats.get('latest_cycle_number') or 'n/a'}",
         f"DB sent in latest cycle: {db_stats.get('latest_cycle_count')}",
@@ -797,8 +785,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             )
     else:
         msg_lines.append("- none")
-
-    msg_lines.extend(["", "Local cache:", f"Cached albums: {total}", f"Cache updated: {_fmt_ts(cache_updated, tz)}"])
 
     await reply(update, context, "\n".join(msg_lines), reply_markup=build_keyboard(None))
 
@@ -851,10 +837,6 @@ def main() -> None:
     default_timezone_name = os.getenv("DEFAULT_TIMEZONE", "UTC").strip() or "UTC"
     tz = resolve_app_timezone(admin_chat_id_override, default_timezone_name)
 
-    provider_name = os.getenv("ACTIVE_PROVIDER", "ytmusic").strip() or "ytmusic"
-    auth_path = os.getenv("YTM_AUTH_PATH", "secrets/browser.json")
-    provider_client = build_provider_client(provider_name, auth_path=auth_path)
-    cache_path = os.getenv("ALBUM_CACHE_PATH", "data/albums_cache.json")
     library_limit = int(os.getenv("LIBRARY_LIMIT", "500"))
     log_level_name = os.getenv("LOG_LEVEL", "INFO").strip().upper()
     log_level = getattr(logging, log_level_name, None)
@@ -867,7 +849,7 @@ def main() -> None:
     _log_bot_event(
         "bot_started",
         message=(
-            f"bot_started provider={provider_name} tz={tz.key} "
+            f"bot_started tz={tz.key} "
             f"library_limit={library_limit} allowed_chat_id={admin_chat_id_override}"
         ),
     )
@@ -876,8 +858,6 @@ def main() -> None:
 
     # Store config in bot_data so handlers/jobs can access it.
     app.bot_data["admin_chat_id_override"] = admin_chat_id_override
-    app.bot_data["provider_client"] = provider_client
-    app.bot_data["cache_path"] = cache_path
     app.bot_data["library_limit"] = library_limit
     app.bot_data["tz"] = tz
     app.bot_data["cooldown"] = {"last_ts": 0.0}

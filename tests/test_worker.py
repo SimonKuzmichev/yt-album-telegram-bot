@@ -112,7 +112,7 @@ class IsDueNowTests(unittest.TestCase):
 
 class SyncProviderAccountTests(unittest.TestCase):
     def test_marks_account_needs_reauth_on_auth_error(self) -> None:
-        cfg = SimpleNamespace(provider_client=SimpleNamespace(auth_path="unused"), library_limit=10)
+        cfg = SimpleNamespace(library_limit=10)
         account = {"id": 55, "provider": "ytmusic", "status": "active"}
         provider_client = SimpleNamespace(
             list_saved_albums=lambda limit=None: (_ for _ in ()).throw(RuntimeError("401 unauthorized"))
@@ -133,42 +133,23 @@ class SyncProviderAccountTests(unittest.TestCase):
 
 class DeliveryAlbumSelectionTests(unittest.TestCase):
     def test_uses_cached_provider_albums_when_available(self) -> None:
-        cfg = SimpleNamespace(
-            provider_client=SimpleNamespace(auth_path="unused"),
-            cache_path="unused",
-            library_limit=10,
-        )
+        cfg = SimpleNamespace(library_limit=10)
         cached_albums = [{"provider_album_id": "album-1", "title": "Dummy"}]
 
         with patch.object(worker, "get_active_user_provider_account", return_value={"id": 99, "provider": "ytmusic"}), \
              patch.object(worker, "list_available_user_library_albums", return_value=cached_albums), \
-             patch.object(worker, "_sync_provider_account") as sync_provider_account, \
-             patch.object(worker, "get_albums_with_cache") as get_albums_with_cache:
+             patch.object(worker, "_sync_provider_account") as sync_provider_account:
             albums = _get_delivery_albums(cfg, user_id=7)
 
         self.assertEqual(albums, cached_albums)
         sync_provider_account.assert_not_called()
-        get_albums_with_cache.assert_not_called()
 
-    def test_falls_back_to_legacy_global_cache_when_no_provider_account_exists(self) -> None:
-        cfg = SimpleNamespace(
-            provider_client=SimpleNamespace(auth_path="unused"),
-            cache_path="cache.json",
-            library_limit=25,
-        )
-        legacy_albums = [{"provider_album_id": "album-2", "title": "Legacy"}]
+    def test_raises_when_no_provider_account_exists(self) -> None:
+        cfg = SimpleNamespace(library_limit=25)
 
-        with patch.object(worker, "get_active_user_provider_account", return_value=None), \
-             patch.object(worker, "get_albums_with_cache", return_value=legacy_albums) as get_albums_with_cache:
-            albums = _get_delivery_albums(cfg, user_id=8)
-
-        self.assertEqual(albums, legacy_albums)
-        get_albums_with_cache.assert_called_once_with(
-            provider_client=cfg.provider_client,
-            cache_path="cache.json",
-            refresh=False,
-            limit=25,
-        )
+        with patch.object(worker, "get_active_user_provider_account", return_value=None):
+            with self.assertRaises(RuntimeError):
+                _get_delivery_albums(cfg, user_id=8)
 
 
 if __name__ == "__main__":

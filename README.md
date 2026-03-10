@@ -8,7 +8,7 @@ Telegram bot that sends one random album per day from your YouTube Music library
 - Worker-based daily scheduling per user timezone and local delivery time
 - Manual commands: `/now`, `/nextcycle`, `/refresh`, `/status`
 - Inline buttons: another album, refresh library, status, open album
-- Local album cache for faster library reads
+- Per-user provider account sync and album cache stored in PostgreSQL
 - Basic auth-expiration diagnostics for YT Music credentials
 
 ## Requirements
@@ -17,7 +17,7 @@ Telegram bot that sends one random album per day from your YouTube Music library
 - PostgreSQL
 - Docker Compose
 - Telegram bot token from BotFather
-- YouTube Music auth file at `secrets/browser.json` for `ytmusicapi`
+- `CREDENTIALS_MASTER_KEY` for encrypted provider credentials at rest
 
 Install dependencies:
 
@@ -36,9 +36,8 @@ BOT_TOKEN=...
 DATABASE_URL=postgresql://app:app@localhost:5432/ytabot
 ALLOWED_CHAT_ID=123456789
 
-YTM_AUTH_PATH=secrets/browser.json
-ALBUM_CACHE_PATH=data/albums_cache.json
 LIBRARY_LIMIT=500
+CREDENTIALS_MASTER_KEY=...
 
 DEFAULT_TIMEZONE=UTC
 ```
@@ -46,8 +45,9 @@ DEFAULT_TIMEZONE=UTC
 Notes:
 
 - `DATABASE_URL` is required by both `bot.py` and `worker.py`.
-- `ALLOWED_CHAT_ID` is only an admin override for admin-only commands such as `/approve`, `/block`, `/admin_status`, and `/refresh`.
+- `ALLOWED_CHAT_ID` is only an admin override for admin-only commands such as `/approve`, `/block`, and `/admin_status`.
 - Daily scheduling is executed by `worker.py` using per-user settings stored in the DB.
+- `/refresh` now queues a sync for the calling user’s active provider account.
 - `DAILY_TIME` is no longer used.
 - `bot.py` resolves its app timezone from the admin override user's DB settings when that user exists; otherwise it falls back to `DEFAULT_TIMEZONE`.
 - `WORKER_JOB_LEASE_SECONDS` controls when `running` jobs are considered stale and requeued after a worker crash.
@@ -98,26 +98,26 @@ python3 sripts/get_chat_id.py
 - `/start` - register the user and show readiness
 - `/now` - queue an immediate album delivery
 - `/nextcycle` - queue an album from the next cycle immediately
-- `/refresh` - force refresh of the local album cache (admin override only)
-- `/status` - show DB delivery stats and local cache status
+- `/refresh` - queue a provider library sync for the current user
+- `/status` - show DB delivery stats and active provider status
 - `/settz` - set the user timezone
 - `/settime` - set the user daily local delivery time
 
 ## Data
 
-- `data/albums_cache.json` - cached normalized album list plus `updated_at`
 - `app.delivery_history` - DB delivery history used for no-repeat cycle semantics
 - `app.jobs` - queued delivery work for the worker
+- `app.user_library_albums` - per-user normalized album cache
+- `app.user_provider_accounts` / `app.user_provider_sync_state` - provider auth and sync state
 
 ## Utility Scripts
 
-- `python3 sripts/test_ytmusic.py` - quick check that YT Music auth works
-- `python3 sripts/test_cache.py` - force cache refresh and print sample
 - `python3 sripts/test_format.py` - check URL/message formatting from cache data
+- `python3 scripts/upsert_provider_credentials.py` - store encrypted provider credentials and optionally queue sync jobs
 
 ## Troubleshooting
 
-- Empty library or refresh failures: verify `YTM_AUTH_PATH`, then run `python3 sripts/test_ytmusic.py`.
+- Empty library or refresh failures: verify the user has an active provider account with valid credentials, then queue `/refresh`.
 - No daily deliveries: verify the worker is running and the user has valid DB timezone and daily time settings.
 - Jobs stuck in `running`: verify `WORKER_JOB_LEASE_SECONDS` is appropriate for normal job duration and that the worker loop is running.
 - Unauthorized admin actions: verify `ALLOWED_CHAT_ID`.

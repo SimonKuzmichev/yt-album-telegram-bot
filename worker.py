@@ -32,9 +32,8 @@ from src.db import (
     upsert_user_library_albums,
 )
 from src.errors import is_auth_error
-from src.library import get_albums_with_cache
 from src.logging_utils import configure_logging, log_event
-from src.providers import ProviderClient, build_provider_client
+from src.providers import build_provider_client
 from src.telegram_delivery import send_album_message
 
 
@@ -49,10 +48,7 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class WorkerConfig:
     bot_token: str
-    provider_client: ProviderClient
-    cache_path: str
     library_limit: int
-    provider_name: str
     worker_id: str
     poll_seconds: int
     claim_batch_size: int
@@ -101,18 +97,10 @@ def _load_worker_config() -> WorkerConfig:
     token = _get_env_str("BOT_TOKEN")
     if not token:
         raise RuntimeError("BOT_TOKEN is not set")
-    provider_name = _get_env_str("ACTIVE_PROVIDER", "ytmusic")
-    provider_client = build_provider_client(
-        provider_name,
-        auth_path=_get_env_str("YTM_AUTH_PATH", "secrets/browser.json"),
-    )
 
     return WorkerConfig(
         bot_token=token,
-        provider_client=provider_client,
-        cache_path=_get_env_str("ALBUM_CACHE_PATH", _get_env_str("CACHE_PATH", "data/albums_cache.json")),
         library_limit=_get_env_int("LIBRARY_LIMIT", 500),
-        provider_name=provider_name,
         worker_id=_get_env_str("WORKER_ID", f"worker-{os.getpid()}"),
         poll_seconds=_get_env_int("WORKER_POLL_SECONDS", 15),
         claim_batch_size=_get_env_int("WORKER_CLAIM_BATCH_SIZE", 10),
@@ -235,13 +223,8 @@ def enqueue_due_sync_jobs(cfg: WorkerConfig) -> int:
     return enqueued_count
 
 
-def _build_provider_client_for_account(account: dict, credentials: dict, cfg: WorkerConfig) -> ProviderClient:
-    fallback_auth_path = getattr(cfg.provider_client, "auth_path", None)
-    return build_provider_client(
-        str(account["provider"]),
-        auth_path=fallback_auth_path,
-        credentials=credentials,
-    )
+def _build_provider_client_for_account(account: dict, credentials: dict):
+    return build_provider_client(str(account["provider"]), credentials=credentials)
 
 
 def _sync_provider_account(cfg: WorkerConfig, account: dict) -> list[dict]:
@@ -251,7 +234,7 @@ def _sync_provider_account(cfg: WorkerConfig, account: dict) -> list[dict]:
         raise RuntimeError("Provider credentials are not configured")
 
     mark_user_provider_sync_started(account_id)
-    provider_client = _build_provider_client_for_account(account, credentials, cfg)
+    provider_client = _build_provider_client_for_account(account, credentials)
     try:
         albums = provider_client.list_saved_albums(limit=cfg.library_limit)
         synced_count = upsert_user_library_albums(account_id, albums)
@@ -268,19 +251,13 @@ def _sync_provider_account(cfg: WorkerConfig, account: dict) -> list[dict]:
 
 def _get_delivery_albums(cfg: WorkerConfig, user_id: int) -> list[dict]:
     account = get_active_user_provider_account(user_id)
-    if account is not None:
-        account_id = int(account["id"])
-        cached_albums = list_available_user_library_albums(account_id)
-        if cached_albums:
-            return cached_albums
-        return _sync_provider_account(cfg, account)
-
-    return get_albums_with_cache(
-        provider_client=cfg.provider_client,
-        cache_path=cfg.cache_path,
-        refresh=False,
-        limit=cfg.library_limit,
-    )
+    if account is None:
+        raise RuntimeError("No active provider account is configured")
+    account_id = int(account["id"])
+    cached_albums = list_available_user_library_albums(account_id)
+    if cached_albums:
+        return cached_albums
+    return _sync_provider_account(cfg, account)
 
 
 async def _execute_delivery_job(bot: Bot, cfg: WorkerConfig, job: dict) -> None:
@@ -371,7 +348,7 @@ def _execute_revalidate_provider_job(cfg: WorkerConfig, job: dict) -> None:
     if not credentials:
         raise RuntimeError("Provider credentials are not configured")
 
-    provider_client = _build_provider_client_for_account(account, credentials, cfg)
+    provider_client = _build_provider_client_for_account(account, credentials)
     try:
         provider_client.validate_credentials()
         mark_user_provider_account_status(account_id, "active")
@@ -462,10 +439,7 @@ async def run_worker() -> None:
         logger,
         logging.INFO,
         "worker_started",
-        message=(
-            f"worker_started provider={cfg.provider_name} "
-            f"poll_seconds={cfg.poll_seconds} claim_batch_size={cfg.claim_batch_size}"
-        ),
+        message=f"worker_started poll_seconds={cfg.poll_seconds} claim_batch_size={cfg.claim_batch_size}",
         worker_id=cfg.worker_id,
     )
 

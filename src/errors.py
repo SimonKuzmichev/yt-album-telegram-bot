@@ -33,7 +33,7 @@ def format_auth_help() -> str:
     return (
         "⚠️ YouTube Music auth looks expired.\n\n"
         "Fix:\n"
-        "1) On your PC: regenerate secrets/browser.json (ytmusicapi browser ...)\n"
-        "2) Copy it to the server\n"
-        "3) Restart the bot service\n"
+        "1) Regenerate the user's YT Music credential blob outside the bot\n"
+        "2) Store it with scripts/upsert_provider_credentials.py\n"
+        "3) Queue /refresh for that user\n"
     )

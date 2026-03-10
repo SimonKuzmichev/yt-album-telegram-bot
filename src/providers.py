@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import tempfile
 from typing import Any, Dict, List, Mapping, Optional, Protocol, TypedDict
 from urllib.parse import quote
@@ -144,7 +143,7 @@ def build_provider_client(
 ) -> ProviderClient:
     normalized_name = provider_name.strip().lower()
     if normalized_name == "ytmusic":
-        resolved_auth_path = (auth_path or os.getenv("YTM_AUTH_PATH", "secrets/browser.json")).strip()
+        resolved_auth_path = auth_path.strip() if isinstance(auth_path, str) and auth_path.strip() else None
         return YTMusicProviderClient(auth_path=resolved_auth_path, credentials=credentials)
     if normalized_name == "spotify":
         return SpotifyProviderClient()

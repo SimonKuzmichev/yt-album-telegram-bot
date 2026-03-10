@@ -182,10 +182,7 @@ class JobIntegrationTests(PostgresIntegrationTestCase):
 
         cfg = worker.WorkerConfig(
             bot_token="test-token",
-            provider_client=object(),
-            cache_path="unused",
             library_limit=1,
-            provider_name="ytmusic",
             worker_id="test-worker",
             poll_seconds=1,
             claim_batch_size=10,
