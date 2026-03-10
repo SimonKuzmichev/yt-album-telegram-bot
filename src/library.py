@@ -3,87 +3,98 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from ytmusicapi import YTMusic
+from src.providers import NormalizedAlbum, ProviderClient
 
 
-Album = Dict[str, Any]
+def _coerce_legacy_album(album: Dict[str, Any], default_provider: str) -> Optional[NormalizedAlbum]:
+    provider_album_id = str(
+        album.get("provider_album_id")
+        or album.get("browseId")
+        or album.get("audioPlaylistId")
+        or album.get("playlistId")
+        or ""
+    ).strip()
+    title = str(album.get("title") or "").strip()
+    if not provider_album_id or not title:
+        return None
 
+    artist = str(album.get("artist") or "").strip()
+    url = album.get("url")
+    if not url and album.get("browseId"):
+        url = f"https://music.youtube.com/browse/{provider_album_id}"
 
-def _normalize_album(raw: Dict[str, Any]) -> Album:
-    """
-    Normalize the ytmusicapi response into a stable format for downstream use.
-    """
-    artists = raw.get("artists") or []
-    artist = ", ".join(a.get("name", "") for a in artists if a.get("name")) or raw.get("artist", "")
+    release_year = album.get("release_year", album.get("year"))
+    if release_year in ("", None):
+        release_year = None
+    elif not isinstance(release_year, int):
+        try:
+            release_year = int(release_year)
+        except (TypeError, ValueError):
+            release_year = None
+
+    raw_payload = album.get("raw_payload_json")
+    if not isinstance(raw_payload, dict):
+        raw_payload = dict(album)
 
     return {
-        "title": raw.get("title", "").strip(),
-        "artist": artist.strip(),
-        "year": raw.get("year"),
-        # ytmusicapi payload shape can vary by endpoint/version. Prefer browseId,
-        # then fallback IDs so downstream code still has a stable album identifier.
-        "browseId": raw.get("browseId") or raw.get("audioPlaylistId") or raw.get("playlistId"),
-        "thumbnails": raw.get("thumbnails") or [],
+        "provider": str(album.get("provider") or default_provider),
+        "provider_album_id": provider_album_id,
+        "title": title,
+        "artist": artist,
+        "url": str(url).strip() if url else None,
+        "release_year": release_year,
+        "raw_payload_json": raw_payload,
     }
 
 
-def fetch_library_albums(
-    auth_path: str,
-    limit: Optional[int] = None,
-) -> List[Album]:
-    """
-    Fetch albums directly from the YT Music library.
-    limit=None returns as many items as the method provides. 
-    TODO: pagination may be needed later
-    """
-    yt = YTMusic(auth_path)
-    # ytmusicapi supports limit; None or a large value usually returns more results
-    raw_albums = yt.get_library_albums(limit=limit)
-    albums = [_normalize_album(a) for a in raw_albums]
-
-    # Remove invalid entries without ID/title
-    albums = [a for a in albums if a.get("browseId") and a.get("title")]
+def _normalize_cached_albums(payload: Dict[str, Any], default_provider: str) -> List[NormalizedAlbum]:
+    raw_albums = payload.get("albums") or []
+    albums: List[NormalizedAlbum] = []
+    for raw_album in raw_albums:
+        if not isinstance(raw_album, dict):
+            continue
+        normalized = _coerce_legacy_album(raw_album, default_provider=default_provider)
+        if normalized is not None:
+            albums.append(normalized)
     return albums
 
 
-def load_cached_albums(cache_path: str) -> Optional[List[Album]]:
+def load_cached_albums(cache_path: str, *, default_provider: str) -> Optional[List[NormalizedAlbum]]:
     p = Path(cache_path)
     if not p.exists():
         return None
     with p.open("r", encoding="utf-8") as f:
         payload = json.load(f)
-    return payload.get("albums")
+    return _normalize_cached_albums(payload, default_provider=default_provider)
 
 
-def save_cached_albums(cache_path: str, albums: List[Album]) -> None:
+def save_cached_albums(cache_path: str, provider_name: str, albums: List[NormalizedAlbum]) -> None:
     p = Path(cache_path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"updated_at": int(time.time()), "albums": albums}
+    payload = {
+        "provider": provider_name,
+        "updated_at": int(time.time()),
+        "albums": albums,
+    }
     with p.open("w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
 def get_albums_with_cache(
-    auth_path: str,
+    provider_client: ProviderClient,
     cache_path: str = "data/albums_cache.json",
     refresh: bool = False,
     limit: Optional[int] = None,
-) -> List[Album]:
-    """
-    Unified entry point:
-    - if cache exists and refresh=False, read from cache
-    - otherwise fetch from YT Music and update cache
-    """
+) -> List[NormalizedAlbum]:
     if not refresh:
-        cached = load_cached_albums(cache_path)
-        # Note: empty list is treated as cache miss and triggers a fresh fetch.
-        # This keeps behavior robust when cache file exists but contains no albums.
+        cached = load_cached_albums(cache_path, default_provider=provider_client.provider_name)
         if cached:
             return cached
 
-    albums = fetch_library_albums(auth_path=auth_path, limit=limit)
-    save_cached_albums(cache_path, albums)
+    albums = provider_client.list_saved_albums(limit=limit)
+    save_cached_albums(cache_path, provider_client.provider_name, albums)
     return albums
+
 
 def load_cache_payload(cache_path: str) -> Optional[Dict[str, Any]]:
     p = Path(cache_path)

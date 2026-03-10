@@ -38,12 +38,6 @@ def install_module_stubs() -> None:
         telegram_ext.Defaults = type("Defaults", (), {})
         sys.modules["telegram.ext"] = telegram_ext
 
-    if "src.library" not in sys.modules:
-        library = ModuleType("src.library")
-        library.get_albums_with_cache = lambda *args, **kwargs: []
-        library.load_cache_payload = lambda *args, **kwargs: {}
-        sys.modules["src.library"] = library
-
     if "src.errors" not in sys.modules:
         errors = ModuleType("src.errors")
         errors.is_auth_error = lambda exc: False

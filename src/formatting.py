@@ -1,5 +1,4 @@
 from typing import Any, Dict, Optional
-from urllib.parse import quote
 
 Album = Dict[str, Any]
 
@@ -11,19 +10,15 @@ def _safe_text(value: Any) -> str:
 
 
 def album_url(album: Album) -> Optional[str]:
-    """
-    We’re trying to construct a URL for an album in YouTube Music.
-    Typically, the browseId looks like MPREb_... or something similar.
-    """
-    bid = album.get("browseId")
-    if not bid:
+    url = album.get("url")
+    if not url:
         return None
-    return f"https://music.youtube.com/browse/{quote(str(bid))}"
+    return str(url)
 
 def album_message(album: Album) -> str:
     title = _safe_text(album.get("title"))
     artist = _safe_text(album.get("artist"))
-    year = album.get("year")
+    year = album.get("release_year")
 
     lines = []
     if title and artist:

@@ -20,6 +20,7 @@ from telegram.ext import (
 from src.library import get_albums_with_cache, load_cache_payload
 from src.errors import is_auth_error, format_auth_help
 from src.logging_utils import configure_logging, log_event
+from src.providers import build_provider_client
 from src.db import (
     approve_user,
     block_user,
@@ -626,7 +627,7 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     user_id = update.effective_user.id if update.effective_user else None
     _log_bot_event("command_refresh", user_id=user_id, telegram_chat_id=chat_id)
 
-    auth_path = context.application.bot_data["auth_path"]
+    provider_client = context.application.bot_data["provider_client"]
     cache_path = context.application.bot_data["cache_path"]
     limit = context.application.bot_data["library_limit"]
 
@@ -634,7 +635,7 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     started_at = perf_counter()
     try:
         albums = get_albums_with_cache(
-            auth_path=auth_path,
+            provider_client=provider_client,
             cache_path=cache_path,
             refresh=True,
             limit=limit,
@@ -858,7 +859,9 @@ def main() -> None:
     default_timezone_name = os.getenv("DEFAULT_TIMEZONE", "UTC").strip() or "UTC"
     tz = resolve_app_timezone(admin_chat_id_override, default_timezone_name)
 
+    provider_name = os.getenv("ACTIVE_PROVIDER", "ytmusic").strip() or "ytmusic"
     auth_path = os.getenv("YTM_AUTH_PATH", "secrets/browser.json")
+    provider_client = build_provider_client(provider_name, auth_path=auth_path)
     cache_path = os.getenv("ALBUM_CACHE_PATH", "data/albums_cache.json")
     library_limit = int(os.getenv("LIBRARY_LIMIT", "500"))
     log_level_name = os.getenv("LOG_LEVEL", "INFO").strip().upper()
@@ -872,7 +875,7 @@ def main() -> None:
     _log_bot_event(
         "bot_started",
         message=(
-            f"bot_started tz={tz.key} "
+            f"bot_started provider={provider_name} tz={tz.key} "
             f"library_limit={library_limit} allowed_chat_id={admin_chat_id_override}"
         ),
     )
@@ -881,7 +884,7 @@ def main() -> None:
 
     # Store config in bot_data so handlers/jobs can access it.
     app.bot_data["admin_chat_id_override"] = admin_chat_id_override
-    app.bot_data["auth_path"] = auth_path
+    app.bot_data["provider_client"] = provider_client
     app.bot_data["cache_path"] = cache_path
     app.bot_data["library_limit"] = library_limit
     app.bot_data["tz"] = tz
