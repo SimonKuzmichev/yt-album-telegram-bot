@@ -554,7 +554,7 @@ def mark_job_succeeded(job_id: UUID, idempotency_key: Optional[str] = None) -> N
                         cur.execute(
                             """
                             UPDATE app.idempotency_keys
-                            SET result_job_id = %s
+                            SET job_id = %s
                             WHERE key = %s
                             """,
                             (job_id, idempotency_key),

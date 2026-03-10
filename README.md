@@ -15,6 +15,7 @@ Telegram bot that sends one random album per day from your YouTube Music library
 
 - Python 3.11+
 - PostgreSQL
+- Docker Compose
 - Telegram bot token from BotFather
 - YouTube Music auth file at `secrets/browser.json` for `ytmusicapi`
 
