@@ -7,6 +7,8 @@ from types import ModuleType
 from unittest.mock import patch
 from uuid import uuid4
 
+from cryptography.fernet import Fernet
+
 try:
     import psycopg
     from psycopg.rows import dict_row
@@ -72,7 +74,14 @@ class PostgresIntegrationTestCase(unittest.TestCase):
             raise unittest.SkipTest("app schema is not present in TEST_DATABASE_URL")
 
     def setUp(self) -> None:
-        self.env_patch = patch.dict(os.environ, {"DATABASE_URL": self.test_database_url}, clear=False)
+        self.env_patch = patch.dict(
+            os.environ,
+            {
+                "DATABASE_URL": self.test_database_url,
+                "CREDENTIALS_MASTER_KEY": Fernet.generate_key().decode("utf-8"),
+            },
+            clear=False,
+        )
         self.env_patch.start()
         self.addCleanup(self.env_patch.stop)
         self.reset_database()
@@ -84,6 +93,9 @@ class PostgresIntegrationTestCase(unittest.TestCase):
                     cur.execute(
                         """
                         TRUNCATE TABLE
+                            app.user_library_albums,
+                            app.user_provider_sync_state,
+                            app.user_provider_accounts,
                             app.delivery_history,
                             app.idempotency_keys,
                             app.jobs,
@@ -320,6 +332,69 @@ class DeliveryHistoryIntegrationTests(PostgresIntegrationTestCase):
         self.assertTrue(first_insert)
         self.assertFalse(second_insert)
         self.assertTrue(third_insert)
+
+
+class ProviderAccountIntegrationTests(PostgresIntegrationTestCase):
+    def test_upsert_user_provider_account_credentials_encrypts_and_loads_credentials(self) -> None:
+        user_id = self.create_user(telegram_user_id=1500, telegram_chat_id=2500, username="provider_user")
+
+        row = db.upsert_user_provider_account_credentials(
+            user_id=user_id,
+            provider="ytmusic",
+            credentials={"cookie_blob": "secret-cookie", "visitor_data": "abc123"},
+            status="active",
+            is_active=True,
+        )
+
+        db_row = self.query_one(
+            """
+            SELECT id, provider, credentials_encrypted, is_active
+            FROM app.user_provider_accounts
+            WHERE id = %s
+            """,
+            (row["id"],),
+        )
+
+        self.assertEqual(db_row["provider"], "ytmusic")
+        self.assertTrue(db_row["is_active"])
+        self.assertTrue(str(db_row["credentials_encrypted"]).startswith("fernet:v1:"))
+        self.assertNotIn("secret-cookie", str(db_row["credentials_encrypted"]))
+
+        credentials = db.get_user_provider_account_credentials(int(row["id"]))
+        self.assertEqual(
+            credentials,
+            {"cookie_blob": "secret-cookie", "visitor_data": "abc123"},
+        )
+
+    def test_activating_new_provider_deactivates_previous_active_account(self) -> None:
+        user_id = self.create_user(telegram_user_id=1600, telegram_chat_id=2600, username="switcher")
+
+        first = db.upsert_user_provider_account_credentials(
+            user_id=user_id,
+            provider="ytmusic",
+            credentials={"cookie_blob": "yt"},
+            is_active=True,
+        )
+        second = db.upsert_user_provider_account_credentials(
+            user_id=user_id,
+            provider="spotify",
+            credentials={"refresh_token": "sp"},
+            is_active=True,
+        )
+
+        active = db.get_active_user_provider_account(user_id)
+        inactive_row = self.query_one(
+            """
+            SELECT is_active
+            FROM app.user_provider_accounts
+            WHERE id = %s
+            """,
+            (first["id"],),
+        )
+
+        self.assertEqual(active["id"], second["id"])
+        self.assertEqual(active["provider"], "spotify")
+        self.assertFalse(inactive_row["is_active"])
         self.assertEqual(count_row["cnt"], 2)
 
 

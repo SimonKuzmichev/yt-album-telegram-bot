@@ -1,4 +1,5 @@
 alembic==1.18.4
+cryptography==41.0.7
 python-dotenv==1.2.2
 python-telegram-bot[job-queue,socks]==22.6
 ytmusicapi==1.11.5

@@ -8,10 +8,13 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
+from src.credentials_encryption import decrypt_for_runtime, encrypt_for_storage
+
 
 # NOTE: Schema/migration DDL is intentionally not managed here; Alembic owns it.
 UserRow = Dict[str, Any]
 JobRow = Dict[str, Any]
+ProviderAccountRow = Dict[str, Any]
 logger = logging.getLogger(__name__)
 
 
@@ -865,4 +868,165 @@ def get_admin_status_snapshot(pending_limit: int = 20) -> Dict[str, Any]:
         return result
     except Exception:
         logger.exception("DB get_admin_status_snapshot failed pending_limit=%s", pending_limit)
+        raise
+
+
+def upsert_user_provider_account_credentials(
+    user_id: int,
+    provider: str,
+    credentials: Dict[str, Any],
+    *,
+    status: str = "active",
+    is_active: bool = True,
+    token_expires_at: Optional[datetime] = None,
+) -> ProviderAccountRow:
+    logger.debug(
+        "DB upsert_user_provider_account_credentials started user_id=%s provider=%s is_active=%s",
+        user_id,
+        provider,
+        is_active,
+    )
+    encrypted_credentials = encrypt_for_storage(credentials)
+    normalized_provider = provider.strip().lower()
+    try:
+        with open_db_connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    if is_active:
+                        cur.execute(
+                            """
+                            UPDATE app.user_provider_accounts
+                            SET
+                                is_active = FALSE,
+                                updated_at = NOW()
+                            WHERE user_id = %s
+                              AND provider <> %s
+                              AND is_active = TRUE
+                            """,
+                            (user_id, normalized_provider),
+                        )
+                    cur.execute(
+                        """
+                        INSERT INTO app.user_provider_accounts (
+                            user_id,
+                            provider,
+                            status,
+                            is_active,
+                            credentials_encrypted,
+                            token_expires_at
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (user_id, provider)
+                        DO UPDATE SET
+                            status = EXCLUDED.status,
+                            is_active = EXCLUDED.is_active,
+                            credentials_encrypted = EXCLUDED.credentials_encrypted,
+                            token_expires_at = EXCLUDED.token_expires_at,
+                            updated_at = NOW()
+                        RETURNING
+                            id,
+                            user_id,
+                            provider,
+                            status,
+                            is_active,
+                            token_expires_at,
+                            created_at,
+                            updated_at
+                        """,
+                        (
+                            user_id,
+                            normalized_provider,
+                            status,
+                            is_active,
+                            encrypted_credentials,
+                            token_expires_at,
+                        ),
+                    )
+                    row = cur.fetchone()
+        if row is None:
+            raise RuntimeError("Failed to upsert provider account")
+        logger.debug(
+            "DB upsert_user_provider_account_credentials done account_id=%s user_id=%s provider=%s",
+            row.get("id"),
+            user_id,
+            normalized_provider,
+        )
+        return row
+    except Exception:
+        logger.exception(
+            "DB upsert_user_provider_account_credentials failed user_id=%s provider=%s",
+            user_id,
+            normalized_provider,
+        )
+        raise
+
+
+def get_active_user_provider_account(user_id: int) -> Optional[ProviderAccountRow]:
+    logger.debug("DB get_active_user_provider_account started user_id=%s", user_id)
+    try:
+        with open_db_connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT
+                            id,
+                            user_id,
+                            provider,
+                            status,
+                            is_active,
+                            token_expires_at,
+                            created_at,
+                            updated_at
+                        FROM app.user_provider_accounts
+                        WHERE user_id = %s
+                          AND is_active = TRUE
+                        ORDER BY updated_at DESC, id DESC
+                        LIMIT 1
+                        """,
+                        (user_id,),
+                    )
+                    row = cur.fetchone()
+        logger.debug(
+            "DB get_active_user_provider_account done user_id=%s found=%s",
+            user_id,
+            row is not None,
+        )
+        return row
+    except Exception:
+        logger.exception("DB get_active_user_provider_account failed user_id=%s", user_id)
+        raise
+
+
+def get_user_provider_account_credentials(account_id: int) -> Optional[Dict[str, Any]]:
+    logger.debug("DB get_user_provider_account_credentials started account_id=%s", account_id)
+    try:
+        with open_db_connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT credentials_encrypted
+                        FROM app.user_provider_accounts
+                        WHERE id = %s
+                        """,
+                        (account_id,),
+                    )
+                    row = cur.fetchone()
+        if row is None or not row.get("credentials_encrypted"):
+            logger.debug(
+                "DB get_user_provider_account_credentials done account_id=%s found=false",
+                account_id,
+            )
+            return None
+        credentials = decrypt_for_runtime(str(row["credentials_encrypted"]))
+        if not isinstance(credentials, dict):
+            raise RuntimeError("Provider credentials payload must be a JSON object")
+        logger.debug(
+            "DB get_user_provider_account_credentials done account_id=%s found=true",
+            account_id,
+        )
+        return credentials
+    except Exception:
+        logger.exception("DB get_user_provider_account_credentials failed account_id=%s", account_id)
         raise
