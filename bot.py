@@ -2,7 +2,6 @@ import asyncio
 import logging
 import os
 from datetime import datetime, time as dt_time, timedelta, timezone
-from time import perf_counter
 from uuid import NAMESPACE_URL, uuid4, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Any, Dict, Optional
@@ -17,7 +16,7 @@ from telegram.ext import (
     Defaults,
 )
 
-from src.library import get_albums_with_cache, load_cache_payload
+from src.library import load_cache_payload
 from src.errors import is_auth_error, format_auth_help
 from src.logging_utils import configure_logging, log_event
 from src.providers import build_provider_client
@@ -26,6 +25,7 @@ from src.db import (
     block_user,
     enqueue_job_once,
     ensure_user_settings,
+    get_active_user_provider_account,
     get_admin_status_snapshot,
     get_user_timezone_by_chat_id,
     get_user_delivery_stats,
@@ -46,6 +46,7 @@ from src.telegram_delivery import (
 Album = Dict[str, Any]
 JOB_TYPE_DELIVER_NOW = "deliver_now"
 JOB_TYPE_NEXT_CYCLE_NOW = "next_cycle_now"
+JOB_TYPE_SYNC_LIBRARY = "sync_library"
 logger = logging.getLogger(__name__)
 
 
@@ -611,12 +612,8 @@ async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    admin_chat_id_override = context.application.bot_data["admin_chat_id_override"]
-    if not _is_admin_override_chat(update, admin_chat_id_override):
-        chat_id = get_update_chat_id(update)
-        user_id = update.effective_user.id if update.effective_user else None
-        _log_bot_event("refresh_denied", user_id=user_id, telegram_chat_id=chat_id)
-        await reply(update, context, "Not allowed.")
+    user = await require_allowlisted_user(update, context, "refresh")
+    if user is None:
         return
     chat_id = get_update_chat_id(update)
     if chat_id is None:
@@ -624,42 +621,37 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not await enforce_cooldown(update, context, "refresh"):
         return
 
-    user_id = update.effective_user.id if update.effective_user else None
-    _log_bot_event("command_refresh", user_id=user_id, telegram_chat_id=chat_id)
+    _log_bot_event("command_refresh", user_id=user["id"], telegram_chat_id=chat_id)
 
-    provider_client = context.application.bot_data["provider_client"]
-    cache_path = context.application.bot_data["cache_path"]
-    limit = context.application.bot_data["library_limit"]
-
-    # Force sync of the cached album list.
-    started_at = perf_counter()
-    try:
-        albums = get_albums_with_cache(
-            provider_client=provider_client,
-            cache_path=cache_path,
-            refresh=True,
-            limit=limit,
-        )
-    except Exception as e:
-        await notify_error(context, chat_id, "Failed to refresh library cache", e)
+    provider_account = get_active_user_provider_account(user["id"])
+    if provider_account is None:
+        await reply(update, context, "No active provider account is configured yet.")
         return
 
-    elapsed_ms = int((perf_counter() - started_at) * 1000)
-    _log_bot_event(
-        "library_refreshed",
-        message=f"library_refreshed source=command albums={len(albums)} elapsed_ms={elapsed_ms}",
-        user_id=user_id,
-        telegram_chat_id=chat_id,
-    )
-    if not albums:
-        _log_bot_event(
-            "library_refresh_empty",
-            level=logging.WARNING,
-            message="library_refresh_empty source=command",
-            user_id=user_id,
-            telegram_chat_id=chat_id,
+    request_id = get_request_id(update)
+    idem_key = f"sync:{provider_account['id']}:{request_id}"
+    try:
+        now_utc = datetime.now(timezone.utc)
+        row = enqueue_job_once(
+            idempotency_key=idem_key,
+            idempotency_expires_at=now_utc + timedelta(minutes=30),
+            job_id=uuid4(),
+            user_id=user["id"],
+            job_type=JOB_TYPE_SYNC_LIBRARY,
+            run_at=now_utc,
+            payload={
+                "telegram_chat_id": chat_id,
+                "idempotency_key": idem_key,
+                "user_provider_account_id": int(provider_account["id"]),
+                "provider": provider_account["provider"],
+            },
         )
-    await reply(update, context, f"✅ Refreshed. Cached albums: {len(albums)}", reply_markup=build_keyboard(None))
+        if row is not None:
+            await reply(update, context, "Queued ✅ Library sync will run soon", reply_markup=build_keyboard(None))
+        else:
+            await reply(update, context, "A sync is already queued or running for your library 🙂")
+    except Exception as e:
+        await notify_error(context, chat_id, "Failed to queue library sync", e)
 
 
 async def cmd_nextcycle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -193,6 +193,7 @@ class JobIntegrationTests(PostgresIntegrationTestCase):
             retry_backoff_max_seconds=1800,
             due_window_seconds=60,
             job_lease_seconds=300,
+            provider_sync_interval_seconds=21600,
         )
 
         with patch.object(worker, "datetime", FixedDateTime):
@@ -327,8 +328,6 @@ class DeliveryHistoryIntegrationTests(PostgresIntegrationTestCase):
         second_insert = db.insert_delivery_history(user_id=user_id, cycle_number=1, album_id="album-1")
         third_insert = db.insert_delivery_history(user_id=user_id, cycle_number=2, album_id="album-1")
 
-        count_row = self.query_one("SELECT COUNT(*)::INT AS cnt FROM app.delivery_history WHERE user_id = %s", (user_id,))
-
         self.assertTrue(first_insert)
         self.assertFalse(second_insert)
         self.assertTrue(third_insert)
@@ -390,6 +389,14 @@ class ProviderAccountIntegrationTests(PostgresIntegrationTestCase):
             WHERE id = %s
             """,
             (first["id"],),
+        )
+        count_row = self.query_one(
+            """
+            SELECT COUNT(*)::INT AS cnt
+            FROM app.user_provider_accounts
+            WHERE user_id = %s
+            """,
+            (user_id,),
         )
 
         self.assertEqual(active["id"], second["id"])

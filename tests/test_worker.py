@@ -1,18 +1,22 @@
 import os
 import unittest
 from datetime import datetime, time as dt_time, timezone
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from tests.support import install_module_stubs
 
 install_module_stubs()
 
+import worker  # noqa: E402
 from worker import (  # noqa: E402
     _compute_backoff_seconds,
+    _get_delivery_albums,
     _get_env_int,
     _get_env_str,
     _is_due_now,
     _local_date_key,
+    _sync_provider_account,
 )
 
 
@@ -104,6 +108,67 @@ class IsDueNowTests(unittest.TestCase):
 
         self.assertTrue(due)
         self.assertEqual(local_date, "2026-03-10")
+
+
+class SyncProviderAccountTests(unittest.TestCase):
+    def test_marks_account_needs_reauth_on_auth_error(self) -> None:
+        cfg = SimpleNamespace(provider_client=SimpleNamespace(auth_path="unused"), library_limit=10)
+        account = {"id": 55, "provider": "ytmusic", "status": "active"}
+        provider_client = SimpleNamespace(
+            list_saved_albums=lambda limit=None: (_ for _ in ()).throw(RuntimeError("401 unauthorized"))
+        )
+
+        with patch.object(worker, "get_user_provider_account_credentials", return_value={"cookie_blob": "secret"}), \
+             patch.object(worker, "mark_user_provider_sync_started"), \
+             patch.object(worker, "build_provider_client", return_value=provider_client), \
+             patch.object(worker, "is_auth_error", return_value=True), \
+             patch.object(worker, "mark_user_provider_sync_failed") as mark_failed, \
+             patch.object(worker, "mark_user_provider_account_status") as mark_status:
+            with self.assertRaises(RuntimeError):
+                _sync_provider_account(cfg, account)
+
+        mark_failed.assert_called_once()
+        mark_status.assert_called_once_with(55, "needs_reauth")
+
+
+class DeliveryAlbumSelectionTests(unittest.TestCase):
+    def test_uses_cached_provider_albums_when_available(self) -> None:
+        cfg = SimpleNamespace(
+            provider_client=SimpleNamespace(auth_path="unused"),
+            cache_path="unused",
+            library_limit=10,
+        )
+        cached_albums = [{"provider_album_id": "album-1", "title": "Dummy"}]
+
+        with patch.object(worker, "get_active_user_provider_account", return_value={"id": 99, "provider": "ytmusic"}), \
+             patch.object(worker, "list_available_user_library_albums", return_value=cached_albums), \
+             patch.object(worker, "_sync_provider_account") as sync_provider_account, \
+             patch.object(worker, "get_albums_with_cache") as get_albums_with_cache:
+            albums = _get_delivery_albums(cfg, user_id=7)
+
+        self.assertEqual(albums, cached_albums)
+        sync_provider_account.assert_not_called()
+        get_albums_with_cache.assert_not_called()
+
+    def test_falls_back_to_legacy_global_cache_when_no_provider_account_exists(self) -> None:
+        cfg = SimpleNamespace(
+            provider_client=SimpleNamespace(auth_path="unused"),
+            cache_path="cache.json",
+            library_limit=25,
+        )
+        legacy_albums = [{"provider_album_id": "album-2", "title": "Legacy"}]
+
+        with patch.object(worker, "get_active_user_provider_account", return_value=None), \
+             patch.object(worker, "get_albums_with_cache", return_value=legacy_albums) as get_albums_with_cache:
+            albums = _get_delivery_albums(cfg, user_id=8)
+
+        self.assertEqual(albums, legacy_albums)
+        get_albums_with_cache.assert_called_once_with(
+            provider_client=cfg.provider_client,
+            cache_path="cache.json",
+            refresh=False,
+            limit=25,
+        )
 
 
 if __name__ == "__main__":

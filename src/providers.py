@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import tempfile
 from typing import Any, Dict, List, Mapping, Optional, Protocol, TypedDict
 from urllib.parse import quote
 
@@ -47,13 +49,39 @@ def _normalize_text(value: Any) -> str:
 class YTMusicProviderClient:
     provider_name = "ytmusic"
 
-    def __init__(self, auth_path: str) -> None:
+    def __init__(self, auth_path: Optional[str] = None, credentials: Optional[Any] = None) -> None:
         self.auth_path = auth_path
+        self.credentials = credentials
+        self._materialized_auth_path: Optional[str] = None
+
+    def _resolve_auth_value(self) -> Any:
+        if self.credentials is None:
+            if not self.auth_path:
+                raise RuntimeError("YT Music auth is not configured")
+            return self.auth_path
+
+        if isinstance(self.credentials, str):
+            return self.credentials
+
+        if self._materialized_auth_path is None:
+            # ytmusicapi expects a file-like auth input in some setups, so for
+            # DB-backed credential blobs we materialize one private temp file
+            # per worker process and reuse its path for subsequent client builds.
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                suffix=".json",
+                prefix="ytmusic-auth-",
+                delete=False,
+            ) as tmp:
+                json.dump(self.credentials, tmp, ensure_ascii=False)
+                self._materialized_auth_path = tmp.name
+        return self._materialized_auth_path
 
     def _create_client(self):
         from ytmusicapi import YTMusic
 
-        return YTMusic(self.auth_path)
+        return YTMusic(self._resolve_auth_value())
 
     def validate_credentials(self) -> None:
         self._create_client().get_library_albums(limit=1)
@@ -112,11 +140,12 @@ def build_provider_client(
     provider_name: str,
     *,
     auth_path: Optional[str] = None,
+    credentials: Optional[Any] = None,
 ) -> ProviderClient:
     normalized_name = provider_name.strip().lower()
     if normalized_name == "ytmusic":
         resolved_auth_path = (auth_path or os.getenv("YTM_AUTH_PATH", "secrets/browser.json")).strip()
-        return YTMusicProviderClient(auth_path=resolved_auth_path)
+        return YTMusicProviderClient(auth_path=resolved_auth_path, credentials=credentials)
     if normalized_name == "spotify":
         return SpotifyProviderClient()
     raise RuntimeError(f"Unsupported provider: {provider_name}")

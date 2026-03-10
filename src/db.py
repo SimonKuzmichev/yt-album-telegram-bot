@@ -339,6 +339,42 @@ def list_active_users_with_settings() -> List[UserRow]:
         raise
 
 
+def list_active_users_with_delivery_context() -> List[UserRow]:
+    logger.debug("DB list_active_users_with_delivery_context started")
+    try:
+        with open_db_connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT
+                            u.id AS user_id,
+                            u.telegram_chat_id,
+                            u.allowlisted,
+                            u.status,
+                            s.timezone,
+                            s.daily_time_local,
+                            pa.id AS user_provider_account_id,
+                            pa.provider AS active_provider,
+                            pa.status AS provider_status
+                        FROM app.users AS u
+                        JOIN app.user_settings AS s ON s.user_id = u.id
+                        LEFT JOIN app.user_provider_accounts AS pa
+                          ON pa.user_id = u.id
+                         AND pa.is_active = TRUE
+                        WHERE u.allowlisted = TRUE
+                          AND u.status = 'active'
+                        ORDER BY u.id ASC
+                        """
+                    )
+                    rows = cur.fetchall()
+        logger.debug("DB list_active_users_with_delivery_context done count=%s", len(rows))
+        return rows
+    except Exception:
+        logger.exception("DB list_active_users_with_delivery_context failed")
+        raise
+
+
 def try_insert_idempotency_key(
     key: str,
     user_id: int,
@@ -1029,4 +1065,331 @@ def get_user_provider_account_credentials(account_id: int) -> Optional[Dict[str,
         return credentials
     except Exception:
         logger.exception("DB get_user_provider_account_credentials failed account_id=%s", account_id)
+        raise
+
+
+def get_user_provider_account_by_id(account_id: int) -> Optional[ProviderAccountRow]:
+    logger.debug("DB get_user_provider_account_by_id started account_id=%s", account_id)
+    try:
+        with open_db_connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT
+                            id,
+                            user_id,
+                            provider,
+                            status,
+                            is_active,
+                            token_expires_at,
+                            created_at,
+                            updated_at
+                        FROM app.user_provider_accounts
+                        WHERE id = %s
+                        LIMIT 1
+                        """,
+                        (account_id,),
+                    )
+                    row = cur.fetchone()
+        logger.debug(
+            "DB get_user_provider_account_by_id done account_id=%s found=%s",
+            account_id,
+            row is not None,
+        )
+        return row
+    except Exception:
+        logger.exception("DB get_user_provider_account_by_id failed account_id=%s", account_id)
+        raise
+
+
+def list_provider_accounts_due_for_sync(sync_before: datetime) -> List[ProviderAccountRow]:
+    logger.debug("DB list_provider_accounts_due_for_sync started sync_before=%s", sync_before)
+    try:
+        with open_db_connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT
+                            pa.id,
+                            pa.user_id,
+                            pa.provider,
+                            pa.status,
+                            pa.is_active,
+                            pa.token_expires_at,
+                            s.last_sync_started_at,
+                            s.last_sync_finished_at,
+                            s.last_successful_sync_at,
+                            s.last_error,
+                            s.last_error_at,
+                            s.library_item_count
+                        FROM app.user_provider_accounts AS pa
+                        JOIN app.users AS u ON u.id = pa.user_id
+                        LEFT JOIN app.user_provider_sync_state AS s
+                          ON s.user_provider_account_id = pa.id
+                        WHERE u.allowlisted = TRUE
+                          AND u.status = 'active'
+                          AND pa.is_active = TRUE
+                          AND pa.status = 'active'
+                          AND (
+                              s.last_successful_sync_at IS NULL
+                              OR s.last_successful_sync_at < %s
+                          )
+                        ORDER BY pa.user_id ASC, pa.id ASC
+                        """,
+                        (sync_before,),
+                    )
+                    rows = cur.fetchall()
+        logger.debug("DB list_provider_accounts_due_for_sync done count=%s", len(rows))
+        return rows
+    except Exception:
+        logger.exception("DB list_provider_accounts_due_for_sync failed sync_before=%s", sync_before)
+        raise
+
+
+def mark_user_provider_account_status(account_id: int, status: str) -> Optional[ProviderAccountRow]:
+    logger.debug("DB mark_user_provider_account_status started account_id=%s status=%s", account_id, status)
+    try:
+        with open_db_connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE app.user_provider_accounts
+                        SET
+                            status = %s,
+                            updated_at = NOW()
+                        WHERE id = %s
+                        RETURNING
+                            id,
+                            user_id,
+                            provider,
+                            status,
+                            is_active,
+                            token_expires_at,
+                            created_at,
+                            updated_at
+                        """,
+                        (status, account_id),
+                    )
+                    row = cur.fetchone()
+        logger.debug(
+            "DB mark_user_provider_account_status done account_id=%s found=%s",
+            account_id,
+            row is not None,
+        )
+        return row
+    except Exception:
+        logger.exception("DB mark_user_provider_account_status failed account_id=%s status=%s", account_id, status)
+        raise
+
+
+def mark_user_provider_sync_started(account_id: int) -> None:
+    logger.debug("DB mark_user_provider_sync_started started account_id=%s", account_id)
+    try:
+        with open_db_connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO app.user_provider_sync_state (
+                            user_provider_account_id,
+                            last_sync_started_at
+                        )
+                        VALUES (%s, NOW())
+                        ON CONFLICT (user_provider_account_id)
+                        DO UPDATE SET
+                            last_sync_started_at = NOW()
+                        """,
+                        (account_id,),
+                    )
+        logger.debug("DB mark_user_provider_sync_started done account_id=%s", account_id)
+    except Exception:
+        logger.exception("DB mark_user_provider_sync_started failed account_id=%s", account_id)
+        raise
+
+
+def mark_user_provider_sync_succeeded(account_id: int, library_item_count: int) -> None:
+    logger.debug(
+        "DB mark_user_provider_sync_succeeded started account_id=%s library_item_count=%s",
+        account_id,
+        library_item_count,
+    )
+    try:
+        with open_db_connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO app.user_provider_sync_state (
+                            user_provider_account_id,
+                            last_sync_started_at,
+                            last_sync_finished_at,
+                            last_successful_sync_at,
+                            last_error,
+                            last_error_at,
+                            library_item_count
+                        )
+                        VALUES (%s, NOW(), NOW(), NOW(), NULL, NULL, %s)
+                        ON CONFLICT (user_provider_account_id)
+                        DO UPDATE SET
+                            last_sync_finished_at = NOW(),
+                            last_successful_sync_at = NOW(),
+                            last_error = NULL,
+                            last_error_at = NULL,
+                            library_item_count = EXCLUDED.library_item_count
+                        """,
+                        (account_id, library_item_count),
+                    )
+        logger.debug("DB mark_user_provider_sync_succeeded done account_id=%s", account_id)
+    except Exception:
+        logger.exception("DB mark_user_provider_sync_succeeded failed account_id=%s", account_id)
+        raise
+
+
+def mark_user_provider_sync_failed(account_id: int, error_text: str) -> None:
+    logger.debug("DB mark_user_provider_sync_failed started account_id=%s", account_id)
+    try:
+        with open_db_connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO app.user_provider_sync_state (
+                            user_provider_account_id,
+                            last_sync_started_at,
+                            last_sync_finished_at,
+                            last_error,
+                            last_error_at
+                        )
+                        VALUES (%s, NOW(), NOW(), %s, NOW())
+                        ON CONFLICT (user_provider_account_id)
+                        DO UPDATE SET
+                            last_sync_finished_at = NOW(),
+                            last_error = EXCLUDED.last_error,
+                            last_error_at = NOW()
+                        """,
+                        (account_id, error_text[:1000]),
+                    )
+        logger.debug("DB mark_user_provider_sync_failed done account_id=%s", account_id)
+    except Exception:
+        logger.exception("DB mark_user_provider_sync_failed failed account_id=%s", account_id)
+        raise
+
+
+def upsert_user_library_albums(account_id: int, albums: List[Dict[str, Any]]) -> int:
+    logger.debug("DB upsert_user_library_albums started account_id=%s count=%s", account_id, len(albums))
+    seen_ids: List[str] = []
+    try:
+        with open_db_connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    for album in albums:
+                        provider_album_id = str(album.get("provider_album_id") or "").strip()
+                        if not provider_album_id:
+                            continue
+                        seen_ids.append(provider_album_id)
+                        cur.execute(
+                            """
+                            INSERT INTO app.user_library_albums (
+                                user_provider_account_id,
+                                provider_album_id,
+                                title,
+                                artist,
+                                url,
+                                release_year,
+                                raw_payload_json,
+                                first_seen_at,
+                                last_seen_at,
+                                is_available
+                            )
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW(), TRUE)
+                            ON CONFLICT (user_provider_account_id, provider_album_id)
+                            DO UPDATE SET
+                                title = EXCLUDED.title,
+                                artist = EXCLUDED.artist,
+                                url = EXCLUDED.url,
+                                release_year = EXCLUDED.release_year,
+                                raw_payload_json = EXCLUDED.raw_payload_json,
+                                last_seen_at = NOW(),
+                                is_available = TRUE
+                            """,
+                            (
+                                account_id,
+                                provider_album_id,
+                                album.get("title"),
+                                album.get("artist"),
+                                album.get("url"),
+                                album.get("release_year"),
+                                Json(album.get("raw_payload_json") or {}),
+                            ),
+                        )
+
+                    if seen_ids:
+                        cur.execute(
+                            """
+                            UPDATE app.user_library_albums
+                            SET
+                                is_available = FALSE
+                            WHERE user_provider_account_id = %s
+                              AND NOT (provider_album_id = ANY(%s))
+                            """,
+                            (account_id, seen_ids),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            UPDATE app.user_library_albums
+                            SET
+                                is_available = FALSE
+                            WHERE user_provider_account_id = %s
+                            """,
+                            (account_id,),
+                        )
+        logger.debug("DB upsert_user_library_albums done account_id=%s count=%s", account_id, len(seen_ids))
+        return len(seen_ids)
+    except Exception:
+        logger.exception("DB upsert_user_library_albums failed account_id=%s", account_id)
+        raise
+
+
+def list_available_user_library_albums(account_id: int) -> List[Dict[str, Any]]:
+    logger.debug("DB list_available_user_library_albums started account_id=%s", account_id)
+    try:
+        with open_db_connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT
+                            provider_album_id,
+                            title,
+                            artist,
+                            url,
+                            release_year,
+                            raw_payload_json
+                        FROM app.user_library_albums
+                        WHERE user_provider_account_id = %s
+                          AND is_available = TRUE
+                        ORDER BY lower(title) ASC, id ASC
+                        """,
+                        (account_id,),
+                    )
+                    rows = cur.fetchall()
+        albums = [
+            {
+                "provider_album_id": str(row["provider_album_id"]),
+                "title": row.get("title"),
+                "artist": row.get("artist"),
+                "url": row.get("url"),
+                "release_year": row.get("release_year"),
+                "raw_payload_json": row.get("raw_payload_json") or {},
+            }
+            for row in rows
+        ]
+        logger.debug("DB list_available_user_library_albums done account_id=%s count=%s", account_id, len(albums))
+        return albums
+    except Exception:
+        logger.exception("DB list_available_user_library_albums failed account_id=%s", account_id)
         raise

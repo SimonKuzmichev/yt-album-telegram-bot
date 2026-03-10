@@ -13,14 +13,25 @@ from telegram import Bot
 from src.db import (
     claim_runnable_jobs,
     enqueue_job_once,
+    get_active_user_provider_account,
     get_latest_cycle_number,
+    get_user_provider_account_by_id,
+    get_user_provider_account_credentials,
     insert_delivery_history,
-    list_cycle_album_ids,
-    list_active_users_with_settings,
+    list_active_users_with_delivery_context,
+    list_available_user_library_albums,
     mark_job_failed,
     mark_job_succeeded,
+    mark_user_provider_account_status,
+    mark_user_provider_sync_failed,
+    mark_user_provider_sync_started,
+    mark_user_provider_sync_succeeded,
     requeue_stale_running_jobs,
+    list_cycle_album_ids,
+    list_provider_accounts_due_for_sync,
+    upsert_user_library_albums,
 )
+from src.errors import is_auth_error
 from src.library import get_albums_with_cache
 from src.logging_utils import configure_logging, log_event
 from src.providers import ProviderClient, build_provider_client
@@ -30,6 +41,8 @@ from src.telegram_delivery import send_album_message
 JOB_TYPE_DAILY_DELIVER = "daily_deliver"
 JOB_TYPE_DELIVER_NOW = "deliver_now"
 JOB_TYPE_NEXT_CYCLE_NOW = "next_cycle_now"
+JOB_TYPE_SYNC_LIBRARY = "sync_library"
+JOB_TYPE_REVALIDATE_PROVIDER = "revalidate_provider"
 logger = logging.getLogger(__name__)
 
 
@@ -47,6 +60,7 @@ class WorkerConfig:
     retry_backoff_max_seconds: int
     due_window_seconds: int
     job_lease_seconds: int
+    provider_sync_interval_seconds: int
 
 
 def _get_env_int(name: str, default: int) -> int:
@@ -106,12 +120,13 @@ def _load_worker_config() -> WorkerConfig:
         retry_backoff_max_seconds=_get_env_int("WORKER_RETRY_BACKOFF_MAX_SECONDS", 1800),
         due_window_seconds=_get_env_int("WORKER_DUE_WINDOW_SECONDS", 60),
         job_lease_seconds=_get_env_int("WORKER_JOB_LEASE_SECONDS", 300),
+        provider_sync_interval_seconds=_get_env_int("PROVIDER_SYNC_INTERVAL_SECONDS", 21600),
     )
 
 
 def enqueue_due_jobs(cfg: WorkerConfig) -> int:
     now_utc = datetime.now(timezone.utc)
-    users = list_active_users_with_settings()
+    users = list_active_users_with_delivery_context()
     enqueued_count = 0
 
     for user in users:
@@ -186,6 +201,88 @@ def enqueue_due_jobs(cfg: WorkerConfig) -> int:
     return enqueued_count
 
 
+def _sync_bucket(now_utc: datetime, interval_seconds: int) -> int:
+    return int(now_utc.timestamp()) // max(interval_seconds, 1)
+
+
+def enqueue_due_sync_jobs(cfg: WorkerConfig) -> int:
+    now_utc = datetime.now(timezone.utc)
+    sync_before = now_utc - timedelta(seconds=cfg.provider_sync_interval_seconds)
+    accounts = list_provider_accounts_due_for_sync(sync_before=sync_before)
+    enqueued_count = 0
+
+    for account in accounts:
+        account_id = int(account["id"])
+        user_id = int(account["user_id"])
+        provider = str(account["provider"])
+        idem_key = f"sync:{account_id}:{_sync_bucket(now_utc, cfg.provider_sync_interval_seconds)}"
+        row = enqueue_job_once(
+            idempotency_key=idem_key,
+            idempotency_expires_at=now_utc + timedelta(seconds=cfg.provider_sync_interval_seconds * 2),
+            job_id=uuid4(),
+            user_id=user_id,
+            job_type=JOB_TYPE_SYNC_LIBRARY,
+            run_at=now_utc,
+            payload={
+                "idempotency_key": idem_key,
+                "user_provider_account_id": account_id,
+                "provider": provider,
+            },
+        )
+        if row is not None:
+            enqueued_count += 1
+
+    return enqueued_count
+
+
+def _build_provider_client_for_account(account: dict, credentials: dict, cfg: WorkerConfig) -> ProviderClient:
+    fallback_auth_path = getattr(cfg.provider_client, "auth_path", None)
+    return build_provider_client(
+        str(account["provider"]),
+        auth_path=fallback_auth_path,
+        credentials=credentials,
+    )
+
+
+def _sync_provider_account(cfg: WorkerConfig, account: dict) -> list[dict]:
+    account_id = int(account["id"])
+    credentials = get_user_provider_account_credentials(account_id)
+    if not credentials:
+        raise RuntimeError("Provider credentials are not configured")
+
+    mark_user_provider_sync_started(account_id)
+    provider_client = _build_provider_client_for_account(account, credentials, cfg)
+    try:
+        albums = provider_client.list_saved_albums(limit=cfg.library_limit)
+        synced_count = upsert_user_library_albums(account_id, albums)
+        mark_user_provider_sync_succeeded(account_id, library_item_count=synced_count)
+        if str(account.get("status") or "") != "active":
+            mark_user_provider_account_status(account_id, "active")
+        return albums
+    except Exception as exc:
+        mark_user_provider_sync_failed(account_id, str(exc))
+        if is_auth_error(exc):
+            mark_user_provider_account_status(account_id, "needs_reauth")
+        raise
+
+
+def _get_delivery_albums(cfg: WorkerConfig, user_id: int) -> list[dict]:
+    account = get_active_user_provider_account(user_id)
+    if account is not None:
+        account_id = int(account["id"])
+        cached_albums = list_available_user_library_albums(account_id)
+        if cached_albums:
+            return cached_albums
+        return _sync_provider_account(cfg, account)
+
+    return get_albums_with_cache(
+        provider_client=cfg.provider_client,
+        cache_path=cfg.cache_path,
+        refresh=False,
+        limit=cfg.library_limit,
+    )
+
+
 async def _execute_delivery_job(bot: Bot, cfg: WorkerConfig, job: dict) -> None:
     payload = job.get("payload") or {}
     user_id = int(job["user_id"])
@@ -193,12 +290,7 @@ async def _execute_delivery_job(bot: Bot, cfg: WorkerConfig, job: dict) -> None:
     job_type = str(job["job_type"])
     force_next_cycle = bool(payload.get("force_next_cycle")) or job_type == JOB_TYPE_NEXT_CYCLE_NOW
 
-    albums = get_albums_with_cache(
-        provider_client=cfg.provider_client,
-        cache_path=cfg.cache_path,
-        refresh=False,
-        limit=cfg.library_limit,
-    )
+    albums = _get_delivery_albums(cfg, user_id)
     if not albums:
         raise RuntimeError("Library is empty")
 
@@ -259,6 +351,36 @@ async def _execute_delivery_job(bot: Bot, cfg: WorkerConfig, job: dict) -> None:
     await send_album_message(bot, chat_id=chat_id, album=selected_album, prefix=prefix)
 
 
+def _execute_sync_job(cfg: WorkerConfig, job: dict) -> None:
+    payload = job.get("payload") or {}
+    account_id = int(payload["user_provider_account_id"])
+    account = get_user_provider_account_by_id(account_id)
+    if account is None:
+        raise RuntimeError("Provider account not found")
+    _sync_provider_account(cfg, account)
+
+
+def _execute_revalidate_provider_job(cfg: WorkerConfig, job: dict) -> None:
+    payload = job.get("payload") or {}
+    account_id = int(payload["user_provider_account_id"])
+    account = get_user_provider_account_by_id(account_id)
+    if account is None:
+        raise RuntimeError("Provider account not found")
+
+    credentials = get_user_provider_account_credentials(account_id)
+    if not credentials:
+        raise RuntimeError("Provider credentials are not configured")
+
+    provider_client = _build_provider_client_for_account(account, credentials, cfg)
+    try:
+        provider_client.validate_credentials()
+        mark_user_provider_account_status(account_id, "active")
+    except Exception as exc:
+        if is_auth_error(exc):
+            mark_user_provider_account_status(account_id, "needs_reauth")
+        raise
+
+
 async def process_claimed_jobs(bot: Bot, cfg: WorkerConfig) -> int:
     jobs = claim_runnable_jobs(worker_id=cfg.worker_id, batch_size=cfg.claim_batch_size)
     processed = 0
@@ -285,10 +407,14 @@ async def process_claimed_jobs(bot: Bot, cfg: WorkerConfig) -> int:
         )
 
         try:
-            if job_type not in {JOB_TYPE_DAILY_DELIVER, JOB_TYPE_DELIVER_NOW, JOB_TYPE_NEXT_CYCLE_NOW}:
+            if job_type == JOB_TYPE_SYNC_LIBRARY:
+                _execute_sync_job(cfg, job)
+            elif job_type == JOB_TYPE_REVALIDATE_PROVIDER:
+                _execute_revalidate_provider_job(cfg, job)
+            elif job_type in {JOB_TYPE_DAILY_DELIVER, JOB_TYPE_DELIVER_NOW, JOB_TYPE_NEXT_CYCLE_NOW}:
+                await _execute_delivery_job(bot, cfg, job)
+            else:
                 raise RuntimeError(f"Unsupported job_type: {job_type}")
-
-            await _execute_delivery_job(bot, cfg, job)
             mark_job_succeeded(job_id=job_id, idempotency_key=idem_key)
             log_event(
                 logger,
@@ -346,6 +472,7 @@ async def run_worker() -> None:
     while True:
         try:
             enqueued = enqueue_due_jobs(cfg)
+            sync_enqueued = enqueue_due_sync_jobs(cfg)
             requeued = requeue_stale_running_jobs(cfg.job_lease_seconds)
             processed = await process_claimed_jobs(bot, cfg)
             if requeued:
@@ -360,7 +487,10 @@ async def run_worker() -> None:
                 logger,
                 logging.DEBUG,
                 "worker_loop_completed",
-                message=f"worker_loop_completed enqueued={enqueued} requeued={requeued} processed={processed}",
+                message=(
+                    f"worker_loop_completed enqueued={enqueued} "
+                    f"sync_enqueued={sync_enqueued} requeued={requeued} processed={processed}"
+                ),
                 worker_id=cfg.worker_id,
             )
         except Exception:

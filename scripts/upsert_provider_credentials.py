@@ -1,12 +1,13 @@
 import argparse
 import json
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from uuid import uuid4
 
 from dotenv import load_dotenv
 
 from src.credentials_encryption import redact_sensitive_mapping
-from src.db import upsert_user_provider_account_credentials
+from src.db import enqueue_job_once, upsert_user_provider_account_credentials
 
 
 def _parse_args() -> argparse.Namespace:
@@ -24,6 +25,16 @@ def _parse_args() -> argparse.Namespace:
         "--token-expires-at",
         default="",
         help="Optional ISO-8601 timestamp for token expiry, for example 2026-03-10T12:00:00+00:00",
+    )
+    parser.add_argument(
+        "--enqueue-revalidate",
+        action="store_true",
+        help="Queue a revalidate_provider job after updating credentials",
+    )
+    parser.add_argument(
+        "--enqueue-sync",
+        action="store_true",
+        help="Queue a sync_library job after updating credentials",
     )
     return parser.parse_args()
 
@@ -50,6 +61,44 @@ def main() -> None:
         token_expires_at=token_expires_at,
     )
 
+    queued_jobs = []
+    now_utc = datetime.now(timezone.utc)
+    if args.enqueue_revalidate:
+        revalidate_key = f"revalidate:{row['id']}"
+        queued_row = enqueue_job_once(
+            idempotency_key=revalidate_key,
+            idempotency_expires_at=now_utc + timedelta(minutes=15),
+            job_id=uuid4(),
+            user_id=int(row["user_id"]),
+            job_type="revalidate_provider",
+            run_at=now_utc,
+            payload={
+                "idempotency_key": revalidate_key,
+                "user_provider_account_id": int(row["id"]),
+                "provider": row["provider"],
+            },
+        )
+        if queued_row is not None:
+            queued_jobs.append("revalidate_provider")
+
+    if args.enqueue_sync:
+        sync_key = f"sync-now:{row['id']}"
+        queued_row = enqueue_job_once(
+            idempotency_key=sync_key,
+            idempotency_expires_at=now_utc + timedelta(minutes=15),
+            job_id=uuid4(),
+            user_id=int(row["user_id"]),
+            job_type="sync_library",
+            run_at=now_utc,
+            payload={
+                "idempotency_key": sync_key,
+                "user_provider_account_id": int(row["id"]),
+                "provider": row["provider"],
+            },
+        )
+        if queued_row is not None:
+            queued_jobs.append("sync_library")
+
     print(
         json.dumps(
             {
@@ -60,6 +109,7 @@ def main() -> None:
                 "is_active": row["is_active"],
                 "token_expires_at": row["token_expires_at"].isoformat() if row.get("token_expires_at") else None,
                 "credential_fields": sorted(redact_sensitive_mapping(credentials).keys()),
+                "queued_jobs": queued_jobs,
             },
             indent=2,
             sort_keys=True,
