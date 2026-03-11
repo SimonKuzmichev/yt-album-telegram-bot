@@ -25,10 +25,13 @@ from src.db import (
     ensure_user_settings,
     get_active_user_provider_account,
     get_admin_status_snapshot,
+    get_user_provider_sync_state,
     get_user_timezone_by_chat_id,
     get_user_delivery_stats,
     get_user_settings,
+    list_user_provider_accounts,
     list_recent_deliveries,
+    set_active_user_provider_account,
     set_user_daily_time,
     set_user_timezone,
     upsert_user,
@@ -652,6 +655,70 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await notify_error(context, chat_id, "Failed to queue library sync", e)
 
 
+async def cmd_provider(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = await require_allowlisted_user(update, context, "provider")
+    if user is None:
+        return
+    chat_id = get_update_chat_id(update)
+    if chat_id is None:
+        return
+
+    try:
+        accounts = list_user_provider_accounts(user["id"])
+    except Exception as e:
+        await notify_error(context, chat_id, "Failed to load provider accounts", e)
+        return
+
+    if not accounts:
+        await reply(update, context, "No provider accounts are configured yet.")
+        return
+
+    if not context.args:
+        lines = ["Providers:"]
+        for account in accounts:
+            marker = "*" if account.get("is_active") else "-"
+            lines.append(f"{marker} {account.get('provider')} status={account.get('status')}")
+        lines.append("")
+        lines.append("Usage: /provider <provider_name>")
+        await reply(update, context, "\n".join(lines))
+        return
+
+    target_provider = context.args[0].strip().lower()
+    try:
+        account = set_active_user_provider_account(user["id"], target_provider)
+    except Exception as e:
+        await notify_error(context, chat_id, "Failed to switch provider", e)
+        return
+
+    if account is None:
+        await reply(update, context, f"Provider not found: {target_provider}")
+        return
+
+    await reply(
+        update,
+        context,
+        f"✅ Active provider set to {account['provider']} (status={account['status']})",
+    )
+
+
+async def cmd_connect_ytmusic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = await require_allowlisted_user(update, context, "connect_ytmusic")
+    if user is None:
+        return
+    await reply(
+        update,
+        context,
+        "YT Music connection is still manual in Phase 2.\nSend the credential blob to the admin so it can be stored for your account.",
+    )
+
+
+async def cmd_connect_spotify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = await require_allowlisted_user(update, context, "connect_spotify")
+    if user is None:
+        return
+    await reply(update, context, "Spotify connection is not implemented yet.")
+
+
 async def cmd_nextcycle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = await require_allowlisted_user(update, context, "nextcycle")
     if user is None:
@@ -757,6 +824,14 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await notify_error(context, chat_id, "Failed to load DB status", e)
         return
 
+    sync_state = None
+    if provider_account is not None:
+        try:
+            sync_state = get_user_provider_sync_state(int(provider_account["id"]))
+        except Exception as e:
+            await notify_error(context, chat_id, "Failed to load provider sync status", e)
+            return
+
     _log_bot_event(
         "status_snapshot",
         message="status_snapshot",
@@ -771,6 +846,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"Daily time: {settings.get('daily_time_local')}",
         f"Active provider: {(provider_account or {}).get('provider') or 'n/a'}",
         f"Provider status: {(provider_account or {}).get('status') or 'n/a'}",
+        f"Last sync: {_fmt_ts((sync_state or {}).get('last_successful_sync_at'), tz)}",
+        f"Last sync error: {(sync_state or {}).get('last_error') or 'n/a'}",
+        f"Cached albums: {(sync_state or {}).get('library_item_count') or 0}",
         f"DB deliveries total: {db_stats.get('total_deliveries')}",
         f"DB latest cycle: {db_stats.get('latest_cycle_number') or 'n/a'}",
         f"DB sent in latest cycle: {db_stats.get('latest_cycle_count')}",
@@ -869,6 +947,9 @@ def main() -> None:
     app.add_handler(CommandHandler("admin_status", cmd_admin_status))
     app.add_handler(CommandHandler("settz", cmd_settz))
     app.add_handler(CommandHandler("settime", cmd_settime))
+    app.add_handler(CommandHandler("provider", cmd_provider))
+    app.add_handler(CommandHandler("connect_ytmusic", cmd_connect_ytmusic))
+    app.add_handler(CommandHandler("connect_spotify", cmd_connect_spotify))
     app.add_handler(CommandHandler("now", cmd_now))
     app.add_handler(CommandHandler("nextcycle", cmd_nextcycle))
     app.add_handler(CommandHandler("refresh", cmd_refresh))

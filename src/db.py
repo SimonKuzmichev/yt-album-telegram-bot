@@ -1034,6 +1034,108 @@ def get_active_user_provider_account(user_id: int) -> Optional[ProviderAccountRo
         raise
 
 
+def list_user_provider_accounts(user_id: int) -> List[ProviderAccountRow]:
+    logger.debug("DB list_user_provider_accounts started user_id=%s", user_id)
+    try:
+        with open_db_connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT
+                            id,
+                            user_id,
+                            provider,
+                            status,
+                            is_active,
+                            token_expires_at,
+                            created_at,
+                            updated_at
+                        FROM app.user_provider_accounts
+                        WHERE user_id = %s
+                        ORDER BY is_active DESC, provider ASC, id ASC
+                        """,
+                        (user_id,),
+                    )
+                    rows = cur.fetchall()
+        logger.debug("DB list_user_provider_accounts done user_id=%s count=%s", user_id, len(rows))
+        return rows
+    except Exception:
+        logger.exception("DB list_user_provider_accounts failed user_id=%s", user_id)
+        raise
+
+
+def set_active_user_provider_account(user_id: int, provider: str) -> Optional[ProviderAccountRow]:
+    logger.debug("DB set_active_user_provider_account started user_id=%s provider=%s", user_id, provider)
+    normalized_provider = provider.strip().lower()
+    try:
+        with open_db_connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT
+                            id,
+                            user_id,
+                            provider,
+                            status,
+                            is_active,
+                            token_expires_at,
+                            created_at,
+                            updated_at
+                        FROM app.user_provider_accounts
+                        WHERE user_id = %s
+                          AND provider = %s
+                        LIMIT 1
+                        """,
+                        (user_id, normalized_provider),
+                    )
+                    existing = cur.fetchone()
+                    if existing is None:
+                        return None
+
+                    cur.execute(
+                        """
+                        UPDATE app.user_provider_accounts
+                        SET
+                            is_active = CASE WHEN provider = %s THEN TRUE ELSE FALSE END,
+                            updated_at = NOW()
+                        WHERE user_id = %s
+                        """,
+                        (normalized_provider, user_id),
+                    )
+
+                    cur.execute(
+                        """
+                        SELECT
+                            id,
+                            user_id,
+                            provider,
+                            status,
+                            is_active,
+                            token_expires_at,
+                            created_at,
+                            updated_at
+                        FROM app.user_provider_accounts
+                        WHERE user_id = %s
+                          AND provider = %s
+                        LIMIT 1
+                        """,
+                        (user_id, normalized_provider),
+                    )
+                    row = cur.fetchone()
+        logger.debug(
+            "DB set_active_user_provider_account done user_id=%s provider=%s found=%s",
+            user_id,
+            normalized_provider,
+            row is not None,
+        )
+        return row
+    except Exception:
+        logger.exception("DB set_active_user_provider_account failed user_id=%s provider=%s", user_id, normalized_provider)
+        raise
+
+
 def get_user_provider_account_credentials(account_id: int) -> Optional[Dict[str, Any]]:
     logger.debug("DB get_user_provider_account_credentials started account_id=%s", account_id)
     try:
@@ -1392,4 +1494,37 @@ def list_available_user_library_albums(account_id: int) -> List[Dict[str, Any]]:
         return albums
     except Exception:
         logger.exception("DB list_available_user_library_albums failed account_id=%s", account_id)
+        raise
+
+
+def get_user_provider_sync_state(account_id: int) -> Optional[UserRow]:
+    logger.debug("DB get_user_provider_sync_state started account_id=%s", account_id)
+    try:
+        with open_db_connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT
+                            last_sync_started_at,
+                            last_sync_finished_at,
+                            last_successful_sync_at,
+                            last_error,
+                            last_error_at,
+                            library_item_count
+                        FROM app.user_provider_sync_state
+                        WHERE user_provider_account_id = %s
+                        LIMIT 1
+                        """,
+                        (account_id,),
+                    )
+                    row = cur.fetchone()
+        logger.debug(
+            "DB get_user_provider_sync_state done account_id=%s found=%s",
+            account_id,
+            row is not None,
+        )
+        return row
+    except Exception:
+        logger.exception("DB get_user_provider_sync_state failed account_id=%s", account_id)
         raise
