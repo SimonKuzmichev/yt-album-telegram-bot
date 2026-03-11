@@ -2,7 +2,7 @@ import os
 import unittest
 from datetime import datetime, time as dt_time, timezone
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from uuid import UUID, NAMESPACE_URL, uuid5
 from zoneinfo import ZoneInfo
 
@@ -11,8 +11,13 @@ from tests.support import install_module_stubs
 install_module_stubs()
 
 from bot import (  # noqa: E402
+    COMMAND_LOCK_TTLS_SECONDS,
     _fmt_ts,
     _is_admin_override_chat,
+    acquire_command_lock,
+    enforce_command_lock,
+    get_command_lock_key,
+    get_env_str,
     get_optional_env_int,
     get_request_id,
     parse_time_hhmm,
@@ -48,6 +53,20 @@ class GetOptionalEnvIntTests(unittest.TestCase):
     def test_parses_integer_value(self) -> None:
         with patch.dict(os.environ, {"VALUE": "42"}, clear=True):
             self.assertEqual(get_optional_env_int("VALUE"), 42)
+
+
+class GetEnvStrTests(unittest.TestCase):
+    def test_returns_default_when_variable_missing(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(get_env_str("MISSING", "fallback"), "fallback")
+
+    def test_returns_default_for_blank_string(self) -> None:
+        with patch.dict(os.environ, {"VALUE": "   "}, clear=True):
+            self.assertEqual(get_env_str("VALUE", "fallback"), "fallback")
+
+    def test_returns_stripped_value(self) -> None:
+        with patch.dict(os.environ, {"VALUE": " redis://localhost:6379/0 "}, clear=True):
+            self.assertEqual(get_env_str("VALUE", "fallback"), "redis://localhost:6379/0")
 
 
 class GetRequestIdTests(unittest.TestCase):
@@ -104,6 +123,40 @@ class IsAdminOverrideChatTests(unittest.TestCase):
     def test_false_when_chat_differs(self) -> None:
         update = SimpleNamespace(effective_chat=SimpleNamespace(id=123))
         self.assertFalse(_is_admin_override_chat(update, 456))
+
+
+class CommandLockTests(unittest.IsolatedAsyncioTestCase):
+    def test_get_command_lock_key_uses_action_and_user_id(self) -> None:
+        self.assertEqual(get_command_lock_key("refresh", 42), "command-lock:refresh:42")
+
+    async def test_acquire_command_lock_sets_expected_ttl(self) -> None:
+        redis_client = SimpleNamespace(set=AsyncMock(return_value=True))
+        context = SimpleNamespace(application=SimpleNamespace(bot_data={"redis": redis_client}))
+
+        acquired = await acquire_command_lock(context, "refresh", 42)
+
+        self.assertTrue(acquired)
+        redis_client.set.assert_awaited_once_with(
+            "command-lock:refresh:42",
+            "1",
+            ex=COMMAND_LOCK_TTLS_SECONDS["refresh"],
+            nx=True,
+        )
+
+    async def test_enforce_command_lock_replies_when_lock_exists(self) -> None:
+        redis_client = SimpleNamespace(set=AsyncMock(return_value=False))
+        context = SimpleNamespace(application=SimpleNamespace(bot_data={"redis": redis_client}))
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=99),
+            callback_query=None,
+            message=SimpleNamespace(reply_text=AsyncMock()),
+            effective_user=SimpleNamespace(id=42),
+        )
+
+        allowed = await enforce_command_lock(update, context, "now", 42)
+
+        self.assertFalse(allowed)
+        update.message.reply_text.assert_awaited_once()
 
 
 class FmtTsTests(unittest.TestCase):

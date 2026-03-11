@@ -7,6 +7,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Any, Dict, Optional
 
 from dotenv import load_dotenv
+try:
+    import redis.asyncio as redis
+except ModuleNotFoundError:  # pragma: no cover - exercised only when dependency is absent
+    redis = None
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -48,6 +52,11 @@ Album = Dict[str, Any]
 JOB_TYPE_DELIVER_NOW = "deliver_now"
 JOB_TYPE_NEXT_CYCLE_NOW = "next_cycle_now"
 JOB_TYPE_SYNC_LIBRARY = "sync_library"
+COMMAND_LOCK_TTLS_SECONDS = {
+    "refresh": 60,
+    "now": 5,
+    "nextcycle": 60,
+}
 logger = logging.getLogger(__name__)
 
 
@@ -112,6 +121,75 @@ async def enforce_cooldown(
         await update.callback_query.answer("Too fast 🙂", show_alert=False)
     else:
         await reply(update, context, "Too fast 🙂")
+    return False
+
+
+def get_env_str(name: str, default: str) -> str:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    stripped = value.strip()
+    return stripped or default
+
+
+def get_command_lock_key(action: str, user_id: int) -> str:
+    return f"command-lock:{action}:{user_id}"
+
+
+async def acquire_command_lock(
+    context: ContextTypes.DEFAULT_TYPE,
+    action: str,
+    user_id: int,
+) -> bool:
+    ttl_seconds = COMMAND_LOCK_TTLS_SECONDS.get(action)
+    if ttl_seconds is None:
+        raise ValueError(f"Unsupported command lock action: {action}")
+
+    redis_client = context.application.bot_data.get("redis")
+    if redis_client is None:
+        raise RuntimeError("Redis client is not configured")
+
+    result = await redis_client.set(
+        get_command_lock_key(action, user_id),
+        "1",
+        ex=ttl_seconds,
+        nx=True,
+    )
+    return bool(result)
+
+
+async def enforce_command_lock(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    action: str,
+    user_id: int,
+) -> bool:
+    chat_id = get_update_chat_id(update)
+    try:
+        acquired = await acquire_command_lock(context, action, user_id)
+    except Exception as e:
+        if chat_id is not None:
+            await notify_error(context, chat_id, f"Failed to acquire /{action} lock", e)
+        _log_bot_event(
+            "command_lock_failed",
+            level=logging.ERROR,
+            message=f"command_lock_failed action={action}",
+            exc_info=True,
+            user_id=user_id,
+            telegram_chat_id=chat_id,
+        )
+        return False
+
+    if acquired:
+        return True
+
+    _log_bot_event(
+        "command_locked",
+        message=f"command_locked action={action}",
+        user_id=user_id,
+        telegram_chat_id=chat_id,
+    )
+    await reply(update, context, "This command is already in progress. Try again in a few seconds 🙂")
     return False
 
 def parse_time_hhmm(value: str) -> dt_time:
@@ -567,6 +645,8 @@ async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if not await enforce_cooldown(update, context, "now"):
         return
+    if not await enforce_command_lock(update, context, "now", int(user["id"])):
+        return
 
     _log_bot_event("command_now", user_id=user["id"], telegram_chat_id=chat_id)
     request_id = get_request_id(update)
@@ -620,6 +700,8 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if chat_id is None:
         return
     if not await enforce_cooldown(update, context, "refresh"):
+        return
+    if not await enforce_command_lock(update, context, "refresh", int(user["id"])):
         return
 
     _log_bot_event("command_refresh", user_id=user["id"], telegram_chat_id=chat_id)
@@ -727,6 +809,8 @@ async def cmd_nextcycle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if chat_id is None:
         return
     if not await enforce_cooldown(update, context, "nextcycle"):
+        return
+    if not await enforce_command_lock(update, context, "nextcycle", int(user["id"])):
         return
 
     _log_bot_event("command_nextcycle", user_id=user["id"], telegram_chat_id=chat_id)
@@ -916,10 +1000,13 @@ def main() -> None:
     tz = resolve_app_timezone(admin_chat_id_override, default_timezone_name)
 
     library_limit = int(os.getenv("LIBRARY_LIMIT", "500"))
+    redis_url = get_env_str("REDIS_URL", "redis://localhost:6379/0")
     log_level_name = os.getenv("LOG_LEVEL", "INFO").strip().upper()
     log_level = getattr(logging, log_level_name, None)
     if not isinstance(log_level, int):
         raise RuntimeError(f"Invalid LOG_LEVEL: {log_level_name}")
+    if redis is None:
+        raise RuntimeError("redis package is not installed")
 
     configure_logging(log_level)
     logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -933,12 +1020,14 @@ def main() -> None:
     )
 
     app = Application.builder().token(token).defaults(Defaults(tzinfo=tz)).build()
+    redis_client = redis.from_url(redis_url, decode_responses=True)
 
     # Store config in bot_data so handlers/jobs can access it.
     app.bot_data["admin_chat_id_override"] = admin_chat_id_override
     app.bot_data["library_limit"] = library_limit
     app.bot_data["tz"] = tz
     app.bot_data["cooldown"] = {"last_ts": 0.0}
+    app.bot_data["redis"] = redis_client
 
     # Commands
     app.add_handler(CommandHandler("start", cmd_start))
