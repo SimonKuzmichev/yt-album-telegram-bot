@@ -359,7 +359,7 @@ def list_active_users_with_delivery_context() -> List[UserRow]:
                             pa.status AS provider_status
                         FROM app.users AS u
                         JOIN app.user_settings AS s ON s.user_id = u.id
-                        JOIN app.user_provider_accounts AS pa
+                        LEFT JOIN app.user_provider_accounts AS pa
                           ON pa.user_id = u.id
                          AND pa.is_active = TRUE
                         WHERE u.allowlisted = TRUE
