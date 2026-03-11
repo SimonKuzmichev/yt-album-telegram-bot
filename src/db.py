@@ -17,6 +17,16 @@ JobRow = Dict[str, Any]
 ProviderAccountRow = Dict[str, Any]
 logger = logging.getLogger(__name__)
 
+PROVIDER_ACCOUNT_STATUS_PENDING = "pending"
+PROVIDER_ACCOUNT_STATUS_CONNECTED = "connected"
+PROVIDER_ACCOUNT_STATUS_NEEDS_REAUTH = "needs_reauth"
+PROVIDER_ACCOUNT_STATUS_DISABLED = "disabled"
+
+SYNC_RESULT_OK = "ok"
+SYNC_RESULT_TRANSIENT_ERROR = "transient_error"
+SYNC_RESULT_AUTH_ERROR = "auth_error"
+SYNC_RESULT_EMPTY_LIBRARY = "empty_library"
+
 
 def get_database_url() -> str:
     database_url = os.getenv("DATABASE_URL", "").strip()
@@ -912,7 +922,7 @@ def upsert_user_provider_account_credentials(
     provider: str,
     credentials: Dict[str, Any],
     *,
-    status: str = "active",
+    status: str = PROVIDER_ACCOUNT_STATUS_CONNECTED,
     is_active: bool = True,
     token_expires_at: Optional[datetime] = None,
 ) -> ProviderAccountRow:
@@ -1223,6 +1233,7 @@ def list_provider_accounts_due_for_sync(sync_before: datetime) -> List[ProviderA
                             s.last_sync_started_at,
                             s.last_sync_finished_at,
                             s.last_successful_sync_at,
+                            s.last_sync_result,
                             s.last_error,
                             s.last_error_at,
                             s.library_item_count
@@ -1233,14 +1244,14 @@ def list_provider_accounts_due_for_sync(sync_before: datetime) -> List[ProviderA
                         WHERE u.allowlisted = TRUE
                           AND u.status = 'active'
                           AND pa.is_active = TRUE
-                          AND pa.status = 'active'
+                          AND pa.status = %s
                           AND (
-                              s.last_successful_sync_at IS NULL
-                              OR s.last_successful_sync_at < %s
+                              s.last_sync_finished_at IS NULL
+                              OR s.last_sync_finished_at < %s
                           )
                         ORDER BY pa.user_id ASC, pa.id ASC
                         """,
-                        (sync_before,),
+                        (PROVIDER_ACCOUNT_STATUS_CONNECTED, sync_before),
                     )
                     rows = cur.fetchall()
         logger.debug("DB list_provider_accounts_due_for_sync done count=%s", len(rows))
@@ -1312,11 +1323,12 @@ def mark_user_provider_sync_started(account_id: int) -> None:
         raise
 
 
-def mark_user_provider_sync_succeeded(account_id: int, library_item_count: int) -> None:
+def mark_user_provider_sync_succeeded(account_id: int, library_item_count: int, result_status: str = SYNC_RESULT_OK) -> None:
     logger.debug(
-        "DB mark_user_provider_sync_succeeded started account_id=%s library_item_count=%s",
+        "DB mark_user_provider_sync_succeeded started account_id=%s library_item_count=%s result_status=%s",
         account_id,
         library_item_count,
+        result_status,
     )
     try:
         with open_db_connection() as conn:
@@ -1329,20 +1341,22 @@ def mark_user_provider_sync_succeeded(account_id: int, library_item_count: int) 
                             last_sync_started_at,
                             last_sync_finished_at,
                             last_successful_sync_at,
+                            last_sync_result,
                             last_error,
                             last_error_at,
                             library_item_count
                         )
-                        VALUES (%s, NOW(), NOW(), NOW(), NULL, NULL, %s)
+                        VALUES (%s, NOW(), NOW(), NOW(), %s, NULL, NULL, %s)
                         ON CONFLICT (user_provider_account_id)
                         DO UPDATE SET
                             last_sync_finished_at = NOW(),
                             last_successful_sync_at = NOW(),
+                            last_sync_result = EXCLUDED.last_sync_result,
                             last_error = NULL,
                             last_error_at = NULL,
                             library_item_count = EXCLUDED.library_item_count
                         """,
-                        (account_id, library_item_count),
+                        (account_id, result_status, library_item_count),
                     )
         logger.debug("DB mark_user_provider_sync_succeeded done account_id=%s", account_id)
     except Exception:
@@ -1350,8 +1364,12 @@ def mark_user_provider_sync_succeeded(account_id: int, library_item_count: int) 
         raise
 
 
-def mark_user_provider_sync_failed(account_id: int, error_text: str) -> None:
-    logger.debug("DB mark_user_provider_sync_failed started account_id=%s", account_id)
+def mark_user_provider_sync_failed(account_id: int, error_text: str, result_status: str = SYNC_RESULT_TRANSIENT_ERROR) -> None:
+    logger.debug(
+        "DB mark_user_provider_sync_failed started account_id=%s result_status=%s",
+        account_id,
+        result_status,
+    )
     try:
         with open_db_connection() as conn:
             with conn.transaction():
@@ -1362,17 +1380,19 @@ def mark_user_provider_sync_failed(account_id: int, error_text: str) -> None:
                             user_provider_account_id,
                             last_sync_started_at,
                             last_sync_finished_at,
+                            last_sync_result,
                             last_error,
                             last_error_at
                         )
-                        VALUES (%s, NOW(), NOW(), %s, NOW())
+                        VALUES (%s, NOW(), NOW(), %s, %s, NOW())
                         ON CONFLICT (user_provider_account_id)
                         DO UPDATE SET
                             last_sync_finished_at = NOW(),
+                            last_sync_result = EXCLUDED.last_sync_result,
                             last_error = EXCLUDED.last_error,
                             last_error_at = NOW()
                         """,
-                        (account_id, error_text[:1000]),
+                        (account_id, result_status, error_text[:1000]),
                     )
         logger.debug("DB mark_user_provider_sync_failed done account_id=%s", account_id)
     except Exception:
@@ -1509,6 +1529,7 @@ def get_user_provider_sync_state(account_id: int) -> Optional[UserRow]:
                             last_sync_started_at,
                             last_sync_finished_at,
                             last_successful_sync_at,
+                            last_sync_result,
                             last_error,
                             last_error_at,
                             library_item_count

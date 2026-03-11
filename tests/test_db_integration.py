@@ -338,7 +338,7 @@ class ProviderAccountIntegrationTests(PostgresIntegrationTestCase):
             user_id=user_id,
             provider="ytmusic",
             credentials={"cookie_blob": "secret-cookie", "visitor_data": "abc123"},
-            status="active",
+            status="connected",
             is_active=True,
         )
 
@@ -400,6 +400,54 @@ class ProviderAccountIntegrationTests(PostgresIntegrationTestCase):
         self.assertEqual(active["provider"], "spotify")
         self.assertFalse(inactive_row["is_active"])
         self.assertEqual(count_row["cnt"], 2)
+
+    def test_sync_state_tracks_explicit_result_statuses(self) -> None:
+        user_id = self.create_user(telegram_user_id=1700, telegram_chat_id=2700, username="sync_state")
+        account = db.upsert_user_provider_account_credentials(
+            user_id=user_id,
+            provider="ytmusic",
+            credentials={"cookie_blob": "secret-cookie"},
+            status="connected",
+            is_active=True,
+        )
+
+        db.mark_user_provider_sync_started(int(account["id"]))
+        db.mark_user_provider_sync_failed(int(account["id"]), "temporary outage", result_status="transient_error")
+        failed_state = db.get_user_provider_sync_state(int(account["id"]))
+        self.assertEqual(failed_state["last_sync_result"], "transient_error")
+        self.assertEqual(failed_state["last_error"], "temporary outage")
+
+        db.mark_user_provider_sync_succeeded(int(account["id"]), library_item_count=0, result_status="empty_library")
+        empty_state = db.get_user_provider_sync_state(int(account["id"]))
+        self.assertEqual(empty_state["last_sync_result"], "empty_library")
+        self.assertEqual(empty_state["library_item_count"], 0)
+        self.assertIsNone(empty_state["last_error"])
+
+    def test_due_sync_query_only_returns_connected_accounts(self) -> None:
+        sync_before = datetime.now(timezone.utc) - timedelta(hours=6)
+        connected_user_id = self.create_user(telegram_user_id=1800, telegram_chat_id=2800, username="connected")
+        blocked_user_id = self.create_user(telegram_user_id=1801, telegram_chat_id=2801, username="reauth")
+        db.approve_user(1800)
+        db.approve_user(1801)
+
+        connected = db.upsert_user_provider_account_credentials(
+            user_id=connected_user_id,
+            provider="ytmusic",
+            credentials={"cookie_blob": "yt-connected"},
+            status="connected",
+            is_active=True,
+        )
+        db.upsert_user_provider_account_credentials(
+            user_id=blocked_user_id,
+            provider="ytmusic",
+            credentials={"cookie_blob": "yt-reauth"},
+            status="needs_reauth",
+            is_active=True,
+        )
+
+        rows = db.list_provider_accounts_due_for_sync(sync_before=sync_before)
+
+        self.assertEqual([int(row["id"]) for row in rows], [int(connected["id"])])
 
 
 if __name__ == "__main__":

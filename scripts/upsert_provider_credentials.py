@@ -15,7 +15,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--user-id", type=int, required=True, help="Internal app.users.id value")
     parser.add_argument("--provider", required=True, help="Provider name, for example ytmusic or spotify")
     parser.add_argument("--credentials-file", required=True, help="Path to a JSON file with provider credentials")
-    parser.add_argument("--status", default="active", help="Provider account status to store")
+    parser.add_argument(
+        "--status",
+        default="connected",
+        help="Provider account status to store: pending, connected, needs_reauth, or disabled",
+    )
     parser.add_argument(
         "--inactive",
         action="store_true",

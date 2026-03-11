@@ -11,6 +11,12 @@ from dotenv import load_dotenv
 from telegram import Bot
 
 from src.db import (
+    PROVIDER_ACCOUNT_STATUS_CONNECTED,
+    PROVIDER_ACCOUNT_STATUS_NEEDS_REAUTH,
+    SYNC_RESULT_AUTH_ERROR,
+    SYNC_RESULT_EMPTY_LIBRARY,
+    SYNC_RESULT_OK,
+    SYNC_RESULT_TRANSIENT_ERROR,
     claim_runnable_jobs,
     enqueue_job_once,
     get_active_user_provider_account,
@@ -238,14 +244,17 @@ def _sync_provider_account(cfg: WorkerConfig, account: dict) -> list[dict]:
     try:
         albums = provider_client.list_saved_albums(limit=cfg.library_limit)
         synced_count = upsert_user_library_albums(account_id, albums)
-        mark_user_provider_sync_succeeded(account_id, library_item_count=synced_count)
-        if str(account.get("status") or "") != "active":
-            mark_user_provider_account_status(account_id, "active")
+        result_status = SYNC_RESULT_EMPTY_LIBRARY if synced_count == 0 else SYNC_RESULT_OK
+        mark_user_provider_sync_succeeded(account_id, library_item_count=synced_count, result_status=result_status)
+        if str(account.get("status") or "") != PROVIDER_ACCOUNT_STATUS_CONNECTED:
+            mark_user_provider_account_status(account_id, PROVIDER_ACCOUNT_STATUS_CONNECTED)
         return albums
     except Exception as exc:
-        mark_user_provider_sync_failed(account_id, str(exc))
         if is_auth_error(exc):
-            mark_user_provider_account_status(account_id, "needs_reauth")
+            mark_user_provider_sync_failed(account_id, str(exc), result_status=SYNC_RESULT_AUTH_ERROR)
+            mark_user_provider_account_status(account_id, PROVIDER_ACCOUNT_STATUS_NEEDS_REAUTH)
+        else:
+            mark_user_provider_sync_failed(account_id, str(exc), result_status=SYNC_RESULT_TRANSIENT_ERROR)
         raise
 
 
@@ -351,10 +360,10 @@ def _execute_revalidate_provider_job(cfg: WorkerConfig, job: dict) -> None:
     provider_client = _build_provider_client_for_account(account, credentials)
     try:
         provider_client.validate_credentials()
-        mark_user_provider_account_status(account_id, "active")
+        mark_user_provider_account_status(account_id, PROVIDER_ACCOUNT_STATUS_CONNECTED)
     except Exception as exc:
         if is_auth_error(exc):
-            mark_user_provider_account_status(account_id, "needs_reauth")
+            mark_user_provider_account_status(account_id, PROVIDER_ACCOUNT_STATUS_NEEDS_REAUTH)
         raise
 
 

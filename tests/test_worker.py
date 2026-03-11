@@ -113,7 +113,7 @@ class IsDueNowTests(unittest.TestCase):
 class SyncProviderAccountTests(unittest.TestCase):
     def test_marks_account_needs_reauth_on_auth_error(self) -> None:
         cfg = SimpleNamespace(library_limit=10)
-        account = {"id": 55, "provider": "ytmusic", "status": "active"}
+        account = {"id": 55, "provider": "ytmusic", "status": "connected"}
         provider_client = SimpleNamespace(
             list_saved_albums=lambda limit=None: (_ for _ in ()).throw(RuntimeError("401 unauthorized"))
         )
@@ -127,8 +127,25 @@ class SyncProviderAccountTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 _sync_provider_account(cfg, account)
 
-        mark_failed.assert_called_once()
+        mark_failed.assert_called_once_with(55, "401 unauthorized", result_status="auth_error")
         mark_status.assert_called_once_with(55, "needs_reauth")
+
+    def test_marks_empty_library_sync_result_when_provider_returns_no_albums(self) -> None:
+        cfg = SimpleNamespace(library_limit=10)
+        account = {"id": 55, "provider": "ytmusic", "status": "connected"}
+        provider_client = SimpleNamespace(list_saved_albums=lambda limit=None: [])
+
+        with patch.object(worker, "get_user_provider_account_credentials", return_value={"cookie_blob": "secret"}), \
+             patch.object(worker, "mark_user_provider_sync_started"), \
+             patch.object(worker, "build_provider_client", return_value=provider_client), \
+             patch.object(worker, "upsert_user_library_albums", return_value=0), \
+             patch.object(worker, "mark_user_provider_sync_succeeded") as mark_succeeded, \
+             patch.object(worker, "mark_user_provider_account_status") as mark_status:
+            albums = _sync_provider_account(cfg, account)
+
+        self.assertEqual(albums, [])
+        mark_succeeded.assert_called_once_with(55, library_item_count=0, result_status="empty_library")
+        mark_status.assert_not_called()
 
 
 class DeliveryAlbumSelectionTests(unittest.TestCase):

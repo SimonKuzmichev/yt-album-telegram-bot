@@ -52,6 +52,12 @@ def install_module_stubs() -> None:
 
     if "src.db" not in sys.modules:
         db = ModuleType("src.db")
+        db.PROVIDER_ACCOUNT_STATUS_CONNECTED = "connected"
+        db.PROVIDER_ACCOUNT_STATUS_NEEDS_REAUTH = "needs_reauth"
+        db.SYNC_RESULT_AUTH_ERROR = "auth_error"
+        db.SYNC_RESULT_EMPTY_LIBRARY = "empty_library"
+        db.SYNC_RESULT_OK = "ok"
+        db.SYNC_RESULT_TRANSIENT_ERROR = "transient_error"
         for name in [
             "approve_user",
             "block_user",

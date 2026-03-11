@@ -22,6 +22,7 @@ from telegram.ext import (
 from src.errors import is_auth_error, format_auth_help
 from src.logging_utils import configure_logging, log_event
 from src.db import (
+    PROVIDER_ACCOUNT_STATUS_CONNECTED,
     approve_user,
     block_user,
     enqueue_job_once,
@@ -879,6 +880,13 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if provider_account is None:
         await reply(update, context, "No active provider account is configured yet.")
         return
+    if str(provider_account.get("status") or "") != PROVIDER_ACCOUNT_STATUS_CONNECTED:
+        await reply(
+            update,
+            context,
+            f"Active provider cannot sync right now (status={provider_account.get('status')}).",
+        )
+        return
 
     idem_key = f"sync:{provider_account['id']}:{uuid4()}"
     try:
@@ -1099,6 +1107,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"Daily time: {settings.get('daily_time_local')}",
         f"Active provider: {(provider_account or {}).get('provider') or 'n/a'}",
         f"Provider status: {(provider_account or {}).get('status') or 'n/a'}",
+        f"Last sync result: {(sync_state or {}).get('last_sync_result') or 'n/a'}",
         f"Last sync: {_fmt_ts((sync_state or {}).get('last_successful_sync_at'), tz)}",
         f"Last sync error: {(sync_state or {}).get('last_error') or 'n/a'}",
         f"Cached albums: {(sync_state or {}).get('library_item_count') or 0}",
