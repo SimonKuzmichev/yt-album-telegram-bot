@@ -12,12 +12,18 @@ install_module_stubs()
 
 from bot import (  # noqa: E402
     COMMAND_LOCK_TTLS_SECONDS,
+    RATE_LIMIT_WINDOWS,
     _fmt_ts,
     _is_admin_override_chat,
+    _format_retry_after,
+    _get_rate_limit_bucket,
     acquire_command_lock,
+    check_rate_limit,
     enforce_command_lock,
+    enforce_rate_limit,
     get_command_lock_key,
     get_env_str,
+    get_rate_limit_key,
     get_optional_env_int,
     get_request_id,
     parse_time_hhmm,
@@ -67,6 +73,27 @@ class GetEnvStrTests(unittest.TestCase):
     def test_returns_stripped_value(self) -> None:
         with patch.dict(os.environ, {"VALUE": " redis://localhost:6379/0 "}, clear=True):
             self.assertEqual(get_env_str("VALUE", "fallback"), "redis://localhost:6379/0")
+
+
+class RateLimitHelperTests(unittest.TestCase):
+    def test_get_rate_limit_key_uses_action_user_window_and_bucket(self) -> None:
+        self.assertEqual(
+            get_rate_limit_key("now", 42, "hour", 489123),
+            "rate-limit:now:42:hour:489123",
+        )
+
+    def test_get_rate_limit_bucket_uses_fixed_window(self) -> None:
+        self.assertEqual(_get_rate_limit_bucket(7201, 3600), 2)
+
+    def test_format_retry_after_seconds(self) -> None:
+        self.assertEqual(_format_retry_after(45), "45s")
+
+    def test_format_retry_after_minutes(self) -> None:
+        self.assertEqual(_format_retry_after(125), "2m 5s")
+
+    def test_default_rate_limit_windows_are_defined(self) -> None:
+        self.assertEqual(RATE_LIMIT_WINDOWS["now"][0][3], 6)
+        self.assertEqual(RATE_LIMIT_WINDOWS["refresh"][0][3], 2)
 
 
 class GetRequestIdTests(unittest.TestCase):
@@ -154,6 +181,66 @@ class CommandLockTests(unittest.IsolatedAsyncioTestCase):
         )
 
         allowed = await enforce_command_lock(update, context, "now", 42)
+
+        self.assertFalse(allowed)
+        update.message.reply_text.assert_awaited_once()
+
+
+class RateLimitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_check_rate_limit_allows_requests_within_limit(self) -> None:
+        redis_client = SimpleNamespace(
+            incr=AsyncMock(return_value=1),
+            expire=AsyncMock(),
+            ttl=AsyncMock(),
+        )
+        context = SimpleNamespace(application=SimpleNamespace(bot_data={"redis": redis_client}))
+
+        breach = await check_rate_limit(
+            context,
+            "refresh",
+            42,
+            now_utc=datetime(2026, 3, 11, 12, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertIsNone(breach)
+        redis_client.expire.assert_awaited()
+        redis_client.ttl.assert_not_awaited()
+
+    async def test_check_rate_limit_returns_breach_when_limit_exceeded(self) -> None:
+        redis_client = SimpleNamespace(
+            incr=AsyncMock(side_effect=[3]),
+            expire=AsyncMock(),
+            ttl=AsyncMock(return_value=1800),
+        )
+        context = SimpleNamespace(application=SimpleNamespace(bot_data={"redis": redis_client}))
+
+        breach = await check_rate_limit(
+            context,
+            "refresh",
+            42,
+            now_utc=datetime(2026, 3, 11, 12, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertIsNotNone(breach)
+        self.assertEqual(breach["window_name"], "hour")
+        self.assertEqual(breach["limit"], 2)
+        self.assertEqual(breach["retry_after_seconds"], 1800)
+
+    async def test_enforce_rate_limit_replies_when_breached(self) -> None:
+        redis_client = SimpleNamespace(
+            incr=AsyncMock(side_effect=[7]),
+            expire=AsyncMock(),
+            ttl=AsyncMock(return_value=59),
+        )
+        context = SimpleNamespace(application=SimpleNamespace(bot_data={"redis": redis_client}))
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=99),
+            callback_query=None,
+            message=SimpleNamespace(reply_text=AsyncMock()),
+            effective_user=SimpleNamespace(id=42),
+        )
+
+        allowed = await enforce_rate_limit(update, context, "now", 42)
 
         self.assertFalse(allowed)
         update.message.reply_text.assert_awaited_once()

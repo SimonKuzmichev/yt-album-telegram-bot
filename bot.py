@@ -57,6 +57,20 @@ COMMAND_LOCK_TTLS_SECONDS = {
     "now": 5,
     "nextcycle": 60,
 }
+RATE_LIMIT_WINDOWS = {
+    "now": (
+        ("hour", 3600, "NOW_RATE_LIMIT_HOURLY", 6),
+        ("day", 86400, "NOW_RATE_LIMIT_DAILY", 20),
+    ),
+    "nextcycle": (
+        ("hour", 3600, "NEXTCYCLE_RATE_LIMIT_HOURLY", 6),
+        ("day", 86400, "NEXTCYCLE_RATE_LIMIT_DAILY", 20),
+    ),
+    "refresh": (
+        ("hour", 3600, "REFRESH_RATE_LIMIT_HOURLY", 2),
+        ("day", 86400, "REFRESH_RATE_LIMIT_DAILY", 6),
+    ),
+}
 logger = logging.getLogger(__name__)
 
 
@@ -132,8 +146,49 @@ def get_env_str(name: str, default: str) -> str:
     return stripped or default
 
 
+def get_env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    return int(value)
+
+
 def get_command_lock_key(action: str, user_id: int) -> str:
     return f"command-lock:{action}:{user_id}"
+
+
+def get_rate_limit_key(
+    action: str,
+    user_id: int,
+    window_name: str,
+    bucket: int,
+) -> str:
+    return f"rate-limit:{action}:{user_id}:{window_name}:{bucket}"
+
+
+def _get_rate_limit_rules(action: str) -> tuple[tuple[str, int, int], ...]:
+    window_specs = RATE_LIMIT_WINDOWS.get(action)
+    if window_specs is None:
+        raise ValueError(f"Unsupported rate limit action: {action}")
+
+    return tuple(
+        (window_name, window_seconds, get_env_int(env_name, default_limit))
+        for window_name, window_seconds, env_name, default_limit in window_specs
+    )
+
+
+def _get_rate_limit_bucket(now_ts: int, window_seconds: int) -> int:
+    return now_ts // window_seconds
+
+
+def _format_retry_after(retry_after_seconds: int) -> str:
+    if retry_after_seconds <= 60:
+        return f"{retry_after_seconds}s"
+    minutes, seconds = divmod(retry_after_seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {seconds}s" if seconds else f"{minutes}m"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m" if minutes else f"{hours}h"
 
 
 async def acquire_command_lock(
@@ -156,6 +211,42 @@ async def acquire_command_lock(
         nx=True,
     )
     return bool(result)
+
+
+async def check_rate_limit(
+    context: ContextTypes.DEFAULT_TYPE,
+    action: str,
+    user_id: int,
+    now_utc: Optional[datetime] = None,
+) -> Optional[Dict[str, int | str]]:
+    redis_client = context.application.bot_data.get("redis")
+    if redis_client is None:
+        raise RuntimeError("Redis client is not configured")
+
+    current_time = now_utc or datetime.now(timezone.utc)
+    now_ts = int(current_time.timestamp())
+
+    for window_name, window_seconds, limit in _get_rate_limit_rules(action):
+        bucket = _get_rate_limit_bucket(now_ts, window_seconds)
+        key = get_rate_limit_key(action, user_id, window_name, bucket)
+        count = int(await redis_client.incr(key))
+        if count == 1:
+            await redis_client.expire(key, window_seconds)
+        if count <= limit:
+            continue
+
+        retry_after = int(await redis_client.ttl(key))
+        if retry_after < 0:
+            retry_after = window_seconds
+        return {
+            "action": action,
+            "window_name": window_name,
+            "limit": limit,
+            "count": count,
+            "retry_after_seconds": retry_after,
+        }
+
+    return None
 
 
 async def enforce_command_lock(
@@ -190,6 +281,52 @@ async def enforce_command_lock(
         telegram_chat_id=chat_id,
     )
     await reply(update, context, "This command is already in progress. Try again in a few seconds 🙂")
+    return False
+
+
+async def enforce_rate_limit(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    action: str,
+    user_id: int,
+) -> bool:
+    chat_id = get_update_chat_id(update)
+    try:
+        breach = await check_rate_limit(context, action, user_id)
+    except Exception as e:
+        if chat_id is not None:
+            await notify_error(context, chat_id, f"Failed to apply /{action} rate limit", e)
+        _log_bot_event(
+            "rate_limit_failed",
+            level=logging.ERROR,
+            message=f"rate_limit_failed action={action}",
+            exc_info=True,
+            user_id=user_id,
+            telegram_chat_id=chat_id,
+        )
+        return False
+
+    if breach is None:
+        return True
+
+    retry_after_seconds = int(breach["retry_after_seconds"])
+    _log_bot_event(
+        "rate_limited",
+        message=(
+            f"rate_limited action={action} window={breach['window_name']} "
+            f"limit={breach['limit']} count={breach['count']}"
+        ),
+        user_id=user_id,
+        telegram_chat_id=chat_id,
+    )
+    await reply(
+        update,
+        context,
+        (
+            f"Rate limit reached for /{action}. "
+            f"Try again in {_format_retry_after(retry_after_seconds)}."
+        ),
+    )
     return False
 
 def parse_time_hhmm(value: str) -> dt_time:
@@ -645,6 +782,8 @@ async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if not await enforce_cooldown(update, context, "now"):
         return
+    if not await enforce_rate_limit(update, context, "now", int(user["id"])):
+        return
     if not await enforce_command_lock(update, context, "now", int(user["id"])):
         return
 
@@ -700,6 +839,8 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if chat_id is None:
         return
     if not await enforce_cooldown(update, context, "refresh"):
+        return
+    if not await enforce_rate_limit(update, context, "refresh", int(user["id"])):
         return
     if not await enforce_command_lock(update, context, "refresh", int(user["id"])):
         return
@@ -809,6 +950,8 @@ async def cmd_nextcycle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if chat_id is None:
         return
     if not await enforce_cooldown(update, context, "nextcycle"):
+        return
+    if not await enforce_rate_limit(update, context, "nextcycle", int(user["id"])):
         return
     if not await enforce_command_lock(update, context, "nextcycle", int(user["id"])):
         return
