@@ -18,11 +18,14 @@ from bot import (  # noqa: E402
     _format_retry_after,
     _get_rate_limit_bucket,
     acquire_command_lock,
+    acquire_request_dedupe,
     check_rate_limit,
     enforce_command_lock,
+    enforce_request_dedupe,
     enforce_rate_limit,
     get_command_lock_key,
     get_env_str,
+    get_request_dedupe_key,
     get_rate_limit_key,
     get_optional_env_int,
     get_request_id,
@@ -94,6 +97,12 @@ class RateLimitHelperTests(unittest.TestCase):
     def test_default_rate_limit_windows_are_defined(self) -> None:
         self.assertEqual(RATE_LIMIT_WINDOWS["now"][0][3], 6)
         self.assertEqual(RATE_LIMIT_WINDOWS["refresh"][0][3], 2)
+
+    def test_get_request_dedupe_key_uses_action_and_request_id(self) -> None:
+        self.assertEqual(
+            get_request_dedupe_key("now", "req-123"),
+            "request-dedupe:now:req-123",
+        )
 
 
 class GetRequestIdTests(unittest.TestCase):
@@ -181,6 +190,39 @@ class CommandLockTests(unittest.IsolatedAsyncioTestCase):
         )
 
         allowed = await enforce_command_lock(update, context, "now", 42)
+
+        self.assertFalse(allowed)
+        update.message.reply_text.assert_awaited_once()
+
+
+class RequestDedupeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_acquire_request_dedupe_uses_action_ttl(self) -> None:
+        redis_client = SimpleNamespace(set=AsyncMock(return_value=True))
+        context = SimpleNamespace(application=SimpleNamespace(bot_data={"redis": redis_client}))
+
+        acquired = await acquire_request_dedupe(context, "now", "req-123")
+
+        self.assertTrue(acquired)
+        redis_client.set.assert_awaited_once_with(
+            "request-dedupe:now:req-123",
+            "1",
+            ex=COMMAND_LOCK_TTLS_SECONDS["now"],
+            nx=True,
+        )
+
+    async def test_enforce_request_dedupe_replies_when_duplicate(self) -> None:
+        redis_client = SimpleNamespace(set=AsyncMock(return_value=False))
+        context = SimpleNamespace(application=SimpleNamespace(bot_data={"redis": redis_client}))
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=99),
+            callback_query=None,
+            message=SimpleNamespace(reply_text=AsyncMock()),
+            effective_message=SimpleNamespace(message_id=7),
+            effective_user=SimpleNamespace(id=42),
+            update_id=101,
+        )
+
+        allowed = await enforce_request_dedupe(update, context, "now")
 
         self.assertFalse(allowed)
         update.message.reply_text.assert_awaited_once()

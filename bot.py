@@ -1,4 +1,3 @@
-import asyncio
 import logging
 import os
 from datetime import datetime, time as dt_time, timedelta, timezone
@@ -101,42 +100,6 @@ def _log_bot_event(
         idempotency_key=idempotency_key,
     )
 
-def is_cooled_down(app: Application, min_seconds: float = 2.0) -> bool:
-    # Global callback throttle: one shared timestamp in app.bot_data for the whole bot
-    # process (not per user/button). We use event-loop monotonic time to avoid issues
-    # from system clock jumps.
-    now = asyncio.get_event_loop().time()
-    state = app.bot_data["cooldown"]
-    last = float(state.get("last_ts", 0.0))
-    if now - last < min_seconds:
-        return False
-    state["last_ts"] = now
-    return True
-
-
-async def enforce_cooldown(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    action: str,
-    min_seconds: float = 2.0,
-) -> bool:
-    if is_cooled_down(context.application, min_seconds):
-        return True
-
-    chat_id = get_update_chat_id(update)
-    user_id = update.effective_user.id if update.effective_user else None
-    _log_bot_event(
-        "action_throttled",
-        message=f"action_throttled action={action}",
-        user_id=user_id,
-        telegram_chat_id=chat_id,
-    )
-    if update.callback_query is not None:
-        await update.callback_query.answer("Too fast 🙂", show_alert=False)
-    else:
-        await reply(update, context, "Too fast 🙂")
-    return False
-
 
 def get_env_str(name: str, default: str) -> str:
     value = os.getenv(name)
@@ -155,6 +118,10 @@ def get_env_int(name: str, default: int) -> int:
 
 def get_command_lock_key(action: str, user_id: int) -> str:
     return f"command-lock:{action}:{user_id}"
+
+
+def get_request_dedupe_key(action: str, request_id: str) -> str:
+    return f"request-dedupe:{action}:{request_id}"
 
 
 def get_rate_limit_key(
@@ -206,6 +173,28 @@ async def acquire_command_lock(
 
     result = await redis_client.set(
         get_command_lock_key(action, user_id),
+        "1",
+        ex=ttl_seconds,
+        nx=True,
+    )
+    return bool(result)
+
+
+async def acquire_request_dedupe(
+    context: ContextTypes.DEFAULT_TYPE,
+    action: str,
+    request_id: str,
+) -> bool:
+    ttl_seconds = COMMAND_LOCK_TTLS_SECONDS.get(action)
+    if ttl_seconds is None:
+        raise ValueError(f"Unsupported request dedupe action: {action}")
+
+    redis_client = context.application.bot_data.get("redis")
+    if redis_client is None:
+        raise RuntimeError("Redis client is not configured")
+
+    result = await redis_client.set(
+        get_request_dedupe_key(action, request_id),
         "1",
         ex=ttl_seconds,
         nx=True,
@@ -281,6 +270,46 @@ async def enforce_command_lock(
         telegram_chat_id=chat_id,
     )
     await reply(update, context, "This command is already in progress. Try again in a few seconds 🙂")
+    return False
+
+
+async def enforce_request_dedupe(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    action: str,
+) -> bool:
+    chat_id = get_update_chat_id(update)
+    user_id = update.effective_user.id if update.effective_user else None
+    request_id = get_request_id(update)
+
+    try:
+        accepted = await acquire_request_dedupe(context, action, request_id)
+    except Exception as e:
+        if chat_id is not None:
+            await notify_error(context, chat_id, f"Failed to dedupe /{action} request", e)
+        _log_bot_event(
+            "request_dedupe_failed",
+            level=logging.ERROR,
+            message=f"request_dedupe_failed action={action}",
+            exc_info=True,
+            user_id=user_id,
+            telegram_chat_id=chat_id,
+        )
+        return False
+
+    if accepted:
+        return True
+
+    _log_bot_event(
+        "request_deduped",
+        message=f"request_deduped action={action}",
+        user_id=user_id,
+        telegram_chat_id=chat_id,
+    )
+    if update.callback_query is not None:
+        await update.callback_query.answer("Already processing 🙂", show_alert=False)
+    else:
+        await reply(update, context, "Already processing 🙂")
     return False
 
 
@@ -780,7 +809,7 @@ async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = get_update_chat_id(update)
     if chat_id is None:
         return
-    if not await enforce_cooldown(update, context, "now"):
+    if not await enforce_request_dedupe(update, context, "now"):
         return
     if not await enforce_rate_limit(update, context, "now", int(user["id"])):
         return
@@ -788,8 +817,7 @@ async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     _log_bot_event("command_now", user_id=user["id"], telegram_chat_id=chat_id)
-    request_id = get_request_id(update)
-    idem_key = f"manual:{user['id']}:{request_id}"
+    idem_key = f"manual:{user['id']}:{uuid4()}"
 
     try:
         now_utc = datetime.now(timezone.utc)
@@ -838,7 +866,7 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     chat_id = get_update_chat_id(update)
     if chat_id is None:
         return
-    if not await enforce_cooldown(update, context, "refresh"):
+    if not await enforce_request_dedupe(update, context, "refresh"):
         return
     if not await enforce_rate_limit(update, context, "refresh", int(user["id"])):
         return
@@ -852,8 +880,7 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await reply(update, context, "No active provider account is configured yet.")
         return
 
-    request_id = get_request_id(update)
-    idem_key = f"sync:{provider_account['id']}:{request_id}"
+    idem_key = f"sync:{provider_account['id']}:{uuid4()}"
     try:
         now_utc = datetime.now(timezone.utc)
         row = enqueue_job_once(
@@ -949,7 +976,7 @@ async def cmd_nextcycle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     chat_id = get_update_chat_id(update)
     if chat_id is None:
         return
-    if not await enforce_cooldown(update, context, "nextcycle"):
+    if not await enforce_request_dedupe(update, context, "nextcycle"):
         return
     if not await enforce_rate_limit(update, context, "nextcycle", int(user["id"])):
         return
@@ -957,8 +984,7 @@ async def cmd_nextcycle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     _log_bot_event("command_nextcycle", user_id=user["id"], telegram_chat_id=chat_id)
-    request_id = get_request_id(update)
-    idem_key = f"nextcycle:{user['id']}:{request_id}"
+    idem_key = f"nextcycle:{user['id']}:{uuid4()}"
     try:
         now_utc = datetime.now(timezone.utc)
         row = enqueue_job_once(
@@ -1169,7 +1195,6 @@ def main() -> None:
     app.bot_data["admin_chat_id_override"] = admin_chat_id_override
     app.bot_data["library_limit"] = library_limit
     app.bot_data["tz"] = tz
-    app.bot_data["cooldown"] = {"last_ts": 0.0}
     app.bot_data["redis"] = redis_client
 
     # Commands
