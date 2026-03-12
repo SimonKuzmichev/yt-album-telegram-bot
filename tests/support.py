@@ -41,6 +41,7 @@ def install_module_stubs() -> None:
     if "src.errors" not in sys.modules:
         errors = ModuleType("src.errors")
         errors.is_auth_error = lambda exc: False
+        errors.is_rate_limited = lambda exc: False
         errors.format_auth_help = lambda: "auth help"
         sys.modules["src.errors"] = errors
 

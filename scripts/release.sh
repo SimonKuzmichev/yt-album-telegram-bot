@@ -4,7 +4,7 @@ set -euo pipefail
 source .venv/bin/activate
 
 pip install -r requirements.txt
-docker compose up -d db --wait
+docker compose up -d --wait
 alembic upgrade head
 
 sudo systemctl restart yt-album-bot

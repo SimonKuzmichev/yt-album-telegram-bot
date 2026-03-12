@@ -16,6 +16,7 @@ from worker import (  # noqa: E402
     _get_env_str,
     _is_due_now,
     _local_date_key,
+    _sync_log_fields,
     _sync_provider_account,
 )
 
@@ -146,6 +147,52 @@ class SyncProviderAccountTests(unittest.TestCase):
         self.assertEqual(albums, [])
         mark_succeeded.assert_called_once_with(55, library_item_count=0, result_status="empty_library")
         mark_status.assert_not_called()
+
+    def test_logs_structured_sync_failure_fields(self) -> None:
+        cfg = SimpleNamespace(library_limit=10)
+        account = {"id": 55, "provider": "ytmusic", "status": "connected"}
+        sync_job_id = "8eaf4f97-3292-4dde-b79b-cf9493feebce"
+        provider_client = SimpleNamespace(
+            list_saved_albums=lambda limit=None: (_ for _ in ()).throw(RuntimeError("429 too many requests"))
+        )
+
+        with patch.object(worker, "get_user_provider_account_credentials", return_value={"cookie_blob": "secret"}), \
+             patch.object(worker, "mark_user_provider_sync_started"), \
+             patch.object(worker, "build_provider_client", return_value=provider_client), \
+             patch.object(worker, "is_auth_error", return_value=False), \
+             patch.object(worker, "is_rate_limited", return_value=True), \
+             patch.object(worker, "mark_user_provider_sync_failed"), \
+             patch.object(worker, "log_event") as log_event:
+            with self.assertRaises(RuntimeError):
+                _sync_provider_account(cfg, account, sync_job_id=sync_job_id)
+
+        _, level, event = log_event.call_args_list[-1].args[:3]
+        fields = log_event.call_args_list[-1].kwargs
+        self.assertEqual(level, worker.logging.ERROR)
+        self.assertEqual(event, "provider_sync_failed")
+        self.assertEqual(fields["provider"], "ytmusic")
+        self.assertEqual(fields["user_provider_account_id"], 55)
+        self.assertEqual(fields["sync_job_id"], sync_job_id)
+        self.assertEqual(fields["provider_status"], "connected")
+        self.assertEqual(fields["sync_result"], "transient_error")
+        self.assertTrue(fields["rate_limited"])
+
+
+class SyncLogFieldsTests(unittest.TestCase):
+    def test_defaults_to_account_context(self) -> None:
+        fields = _sync_log_fields(account={"id": 3, "provider": "ytmusic", "status": "connected"})
+
+        self.assertEqual(
+            fields,
+            {
+                "provider": "ytmusic",
+                "user_provider_account_id": 3,
+                "sync_job_id": None,
+                "provider_status": "connected",
+                "sync_result": None,
+                "rate_limited": None,
+            },
+        )
 
 
 class DeliveryAlbumSelectionTests(unittest.TestCase):

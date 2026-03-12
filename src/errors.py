@@ -25,6 +25,23 @@ def is_auth_error(exc: Exception) -> bool:
     return any(m in msg for m in auth_markers)
 
 
+def is_rate_limited(exc: Exception) -> bool:
+    """
+    Conservative heuristic for provider-side throttling.
+    """
+    msg = str(exc).lower()
+    rate_limit_markers = [
+        "429",
+        "rate limit",
+        "rate-limit",
+        "too many requests",
+        "quota exceeded",
+        "throttl",
+        "retry after",
+    ]
+    return any(marker in msg for marker in rate_limit_markers)
+
+
 def format_auth_help() -> str:
     """
     Human-readable instructions to recover from expired auth.

@@ -37,7 +37,7 @@ from src.db import (
     list_provider_accounts_due_for_sync,
     upsert_user_library_albums,
 )
-from src.errors import is_auth_error
+from src.errors import is_auth_error, is_rate_limited
 from src.logging_utils import configure_logging, log_event
 from src.providers import build_provider_client
 from src.telegram_delivery import send_album_message
@@ -223,8 +223,35 @@ def enqueue_due_sync_jobs(cfg: WorkerConfig) -> int:
                 "provider": provider,
             },
         )
-        if row is not None:
-            enqueued_count += 1
+        if row is None:
+            log_event(
+                logger,
+                logging.INFO,
+                "provider_sync_enqueue_skipped_idempotency",
+                job_type=JOB_TYPE_SYNC_LIBRARY,
+                user_id=user_id,
+                idempotency_key=idem_key,
+                worker_id=cfg.worker_id,
+                provider=provider,
+                user_provider_account_id=account_id,
+            )
+            continue
+
+        enqueued_count += 1
+        log_event(
+            logger,
+            logging.INFO,
+            "job_enqueued",
+            job_id=row.get("id"),
+            job_type=JOB_TYPE_SYNC_LIBRARY,
+            user_id=user_id,
+            attempt=row.get("attempt"),
+            idempotency_key=idem_key,
+            worker_id=cfg.worker_id,
+            provider=provider,
+            user_provider_account_id=account_id,
+            sync_job_id=row.get("id"),
+        )
 
     return enqueued_count
 
@@ -233,28 +260,84 @@ def _build_provider_client_for_account(account: dict, credentials: dict):
     return build_provider_client(str(account["provider"]), credentials=credentials)
 
 
-def _sync_provider_account(cfg: WorkerConfig, account: dict) -> list[dict]:
+def _sync_log_fields(
+    *,
+    account: dict,
+    sync_job_id: UUID | None = None,
+    provider_status: str | None = None,
+    sync_result: str | None = None,
+    rate_limited: bool | None = None,
+) -> dict:
+    return {
+        "provider": str(account.get("provider") or ""),
+        "user_provider_account_id": account.get("id"),
+        "sync_job_id": sync_job_id,
+        "provider_status": provider_status if provider_status is not None else account.get("status"),
+        "sync_result": sync_result,
+        "rate_limited": rate_limited,
+    }
+
+
+def _sync_provider_account(cfg: WorkerConfig, account: dict, sync_job_id: UUID | None = None) -> list[dict]:
     account_id = int(account["id"])
+    sync_fields = _sync_log_fields(account=account, sync_job_id=sync_job_id)
     credentials = get_user_provider_account_credentials(account_id)
     if not credentials:
         raise RuntimeError("Provider credentials are not configured")
 
     mark_user_provider_sync_started(account_id)
+    log_event(
+        logger,
+        logging.INFO,
+        "provider_sync_started",
+        **sync_fields,
+    )
     provider_client = _build_provider_client_for_account(account, credentials)
     try:
         albums = provider_client.list_saved_albums(limit=cfg.library_limit)
         synced_count = upsert_user_library_albums(account_id, albums)
         result_status = SYNC_RESULT_EMPTY_LIBRARY if synced_count == 0 else SYNC_RESULT_OK
         mark_user_provider_sync_succeeded(account_id, library_item_count=synced_count, result_status=result_status)
+        next_provider_status = PROVIDER_ACCOUNT_STATUS_CONNECTED
         if str(account.get("status") or "") != PROVIDER_ACCOUNT_STATUS_CONNECTED:
             mark_user_provider_account_status(account_id, PROVIDER_ACCOUNT_STATUS_CONNECTED)
+        log_event(
+            logger,
+            logging.INFO,
+            "provider_sync_succeeded",
+            message=f"provider_sync_succeeded library_item_count={synced_count}",
+            **_sync_log_fields(
+                account=account,
+                sync_job_id=sync_job_id,
+                provider_status=next_provider_status,
+                sync_result=result_status,
+                rate_limited=False,
+            ),
+        )
         return albums
     except Exception as exc:
         if is_auth_error(exc):
-            mark_user_provider_sync_failed(account_id, str(exc), result_status=SYNC_RESULT_AUTH_ERROR)
-            mark_user_provider_account_status(account_id, PROVIDER_ACCOUNT_STATUS_NEEDS_REAUTH)
+            result_status = SYNC_RESULT_AUTH_ERROR
+            next_provider_status = PROVIDER_ACCOUNT_STATUS_NEEDS_REAUTH
+            mark_user_provider_sync_failed(account_id, str(exc), result_status=result_status)
+            mark_user_provider_account_status(account_id, next_provider_status)
         else:
-            mark_user_provider_sync_failed(account_id, str(exc), result_status=SYNC_RESULT_TRANSIENT_ERROR)
+            result_status = SYNC_RESULT_TRANSIENT_ERROR
+            next_provider_status = str(account.get("status") or "")
+            mark_user_provider_sync_failed(account_id, str(exc), result_status=result_status)
+        log_event(
+            logger,
+            logging.ERROR,
+            "provider_sync_failed",
+            exc_info=True,
+            **_sync_log_fields(
+                account=account,
+                sync_job_id=sync_job_id,
+                provider_status=next_provider_status,
+                sync_result=result_status,
+                rate_limited=is_rate_limited(exc),
+            ),
+        )
         raise
 
 
@@ -339,15 +422,17 @@ async def _execute_delivery_job(bot: Bot, cfg: WorkerConfig, job: dict) -> None:
 
 def _execute_sync_job(cfg: WorkerConfig, job: dict) -> None:
     payload = job.get("payload") or {}
+    job_id = UUID(str(job["id"]))
     account_id = int(payload["user_provider_account_id"])
     account = get_user_provider_account_by_id(account_id)
     if account is None:
         raise RuntimeError("Provider account not found")
-    _sync_provider_account(cfg, account)
+    _sync_provider_account(cfg, account, sync_job_id=job_id)
 
 
 def _execute_revalidate_provider_job(cfg: WorkerConfig, job: dict) -> None:
     payload = job.get("payload") or {}
+    job_id = UUID(str(job["id"]))
     account_id = int(payload["user_provider_account_id"])
     account = get_user_provider_account_by_id(account_id)
     if account is None:
@@ -361,9 +446,39 @@ def _execute_revalidate_provider_job(cfg: WorkerConfig, job: dict) -> None:
     try:
         provider_client.validate_credentials()
         mark_user_provider_account_status(account_id, PROVIDER_ACCOUNT_STATUS_CONNECTED)
+        log_event(
+            logger,
+            logging.INFO,
+            "provider_revalidation_succeeded",
+            **_sync_log_fields(
+                account=account,
+                sync_job_id=job_id,
+                provider_status=PROVIDER_ACCOUNT_STATUS_CONNECTED,
+                sync_result=SYNC_RESULT_OK,
+                rate_limited=False,
+            ),
+        )
     except Exception as exc:
         if is_auth_error(exc):
             mark_user_provider_account_status(account_id, PROVIDER_ACCOUNT_STATUS_NEEDS_REAUTH)
+            provider_status = PROVIDER_ACCOUNT_STATUS_NEEDS_REAUTH
+            sync_result = SYNC_RESULT_AUTH_ERROR
+        else:
+            provider_status = str(account.get("status") or "")
+            sync_result = SYNC_RESULT_TRANSIENT_ERROR
+        log_event(
+            logger,
+            logging.ERROR,
+            "provider_revalidation_failed",
+            exc_info=True,
+            **_sync_log_fields(
+                account=account,
+                sync_job_id=job_id,
+                provider_status=provider_status,
+                sync_result=sync_result,
+                rate_limited=is_rate_limited(exc),
+            ),
+        )
         raise
 
 
@@ -378,6 +493,9 @@ async def process_claimed_jobs(bot: Bot, cfg: WorkerConfig) -> int:
         payload = job.get("payload") or {}
         idem_key = payload.get("idempotency_key")
         chat_id = payload.get("telegram_chat_id")
+        provider = payload.get("provider")
+        user_provider_account_id = payload.get("user_provider_account_id")
+        sync_job_id = job_id if job_type in {JOB_TYPE_SYNC_LIBRARY, JOB_TYPE_REVALIDATE_PROVIDER} else None
 
         log_event(
             logger,
@@ -390,6 +508,9 @@ async def process_claimed_jobs(bot: Bot, cfg: WorkerConfig) -> int:
             attempt=attempt,
             idempotency_key=idem_key,
             worker_id=cfg.worker_id,
+            provider=provider,
+            user_provider_account_id=user_provider_account_id,
+            sync_job_id=sync_job_id,
         )
 
         try:
@@ -413,6 +534,9 @@ async def process_claimed_jobs(bot: Bot, cfg: WorkerConfig) -> int:
                 attempt=attempt,
                 idempotency_key=idem_key,
                 worker_id=cfg.worker_id,
+                provider=provider,
+                user_provider_account_id=user_provider_account_id,
+                sync_job_id=sync_job_id,
             )
         except Exception as exc:
             backoff_seconds = _compute_backoff_seconds(
@@ -435,6 +559,10 @@ async def process_claimed_jobs(bot: Bot, cfg: WorkerConfig) -> int:
                 attempt=state.get("attempt"),
                 idempotency_key=idem_key,
                 worker_id=cfg.worker_id,
+                provider=provider,
+                user_provider_account_id=user_provider_account_id,
+                sync_job_id=sync_job_id,
+                rate_limited=is_rate_limited(exc) if sync_job_id is not None else None,
             )
         processed += 1
 

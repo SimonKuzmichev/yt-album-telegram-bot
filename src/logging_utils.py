@@ -13,6 +13,12 @@ LOG_FIELDS = (
     "attempt",
     "idempotency_key",
     "worker_id",
+    "provider",
+    "user_provider_account_id",
+    "sync_job_id",
+    "provider_status",
+    "sync_result",
+    "rate_limited",
 )
 
 
