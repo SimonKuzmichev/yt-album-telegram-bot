@@ -917,6 +917,78 @@ def get_admin_status_snapshot(pending_limit: int = 20) -> Dict[str, Any]:
         raise
 
 
+def get_metrics_snapshot() -> Dict[str, List[Dict[str, Any]]]:
+    logger.debug("DB get_metrics_snapshot started")
+    try:
+        with open_db_connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT provider, status, COUNT(*)::BIGINT AS count
+                        FROM app.user_provider_accounts
+                        GROUP BY provider, status
+                        ORDER BY provider ASC, status ASC
+                        """
+                    )
+                    provider_accounts = cur.fetchall()
+
+                    cur.execute(
+                        """
+                        SELECT provider, COUNT(*)::BIGINT AS count
+                        FROM app.user_provider_accounts
+                        WHERE status = %s
+                        GROUP BY provider
+                        ORDER BY provider ASC
+                        """,
+                        (PROVIDER_ACCOUNT_STATUS_NEEDS_REAUTH,),
+                    )
+                    provider_needs_reauth = cur.fetchall()
+
+                    cur.execute(
+                        """
+                        SELECT
+                            pa.provider,
+                            pa.user_id,
+                            COUNT(*)::BIGINT AS count
+                        FROM app.user_library_albums AS ula
+                        JOIN app.user_provider_accounts AS pa
+                          ON pa.id = ula.user_provider_account_id
+                        WHERE ula.is_available = TRUE
+                        GROUP BY pa.provider, pa.user_id
+                        ORDER BY pa.provider ASC, pa.user_id ASC
+                        """
+                    )
+                    provider_library_counts = cur.fetchall()
+
+                    cur.execute(
+                        """
+                        SELECT job_type, status, COUNT(*)::BIGINT AS count
+                        FROM app.jobs
+                        GROUP BY job_type, status
+                        ORDER BY job_type ASC, status ASC
+                        """
+                    )
+                    queue_depth = cur.fetchall()
+        snapshot = {
+            "provider_accounts": provider_accounts,
+            "provider_needs_reauth": provider_needs_reauth,
+            "provider_library_counts": provider_library_counts,
+            "job_queue_depth": queue_depth,
+        }
+        logger.debug(
+            "DB get_metrics_snapshot done provider_accounts=%s needs_reauth=%s library_counts=%s queue_depth=%s",
+            len(provider_accounts),
+            len(provider_needs_reauth),
+            len(provider_library_counts),
+            len(queue_depth),
+        )
+        return snapshot
+    except Exception:
+        logger.exception("DB get_metrics_snapshot failed")
+        raise
+
+
 def upsert_user_provider_account_credentials(
     user_id: int,
     provider: str,

@@ -21,6 +21,7 @@ from telegram.ext import (
 
 from src.errors import is_auth_error, format_auth_help
 from src.logging_utils import configure_logging, log_event
+from src.metrics import record_command, record_rate_limit_hit, start_metrics_server
 from src.db import (
     PROVIDER_ACCOUNT_STATUS_CONNECTED,
     approve_user,
@@ -340,6 +341,7 @@ async def enforce_rate_limit(
         return True
 
     retry_after_seconds = int(breach["retry_after_seconds"])
+    record_rate_limit_hit(action)
     _log_bot_event(
         "rate_limited",
         message=(
@@ -565,474 +567,595 @@ async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, r
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = get_update_chat_id(update)
-    user_id = update.effective_user.id if update.effective_user else None
-    if chat_id is None:
-        _log_bot_event("start_missing_chat", level=logging.WARNING, user_id=user_id)
-        return
-
-    _log_bot_event("command_start", user_id=user_id, telegram_chat_id=chat_id)
+    status = "error"
     try:
-        user = register_user_from_update(update)
-    except Exception as e:
-        await notify_error(context, chat_id, "Failed to register user", e)
-        return
-    if user is None:
-        return
+        chat_id = get_update_chat_id(update)
+        user_id = update.effective_user.id if update.effective_user else None
+        if chat_id is None:
+            _log_bot_event("start_missing_chat", level=logging.WARNING, user_id=user_id)
+            status = "rejected"
+            return
 
-    if not bool(user.get("allowlisted")):
-        await reply(update, context, "Registered. Waiting for approval.")
-        return
+        _log_bot_event("command_start", user_id=user_id, telegram_chat_id=chat_id)
+        try:
+            user = register_user_from_update(update)
+        except Exception as e:
+            await notify_error(context, chat_id, "Failed to register user", e)
+            status = "error"
+            return
+        if user is None:
+            status = "rejected"
+            return
 
-    await reply(
-        update,
-        context,
-        "Welcome, you're active. Use /settime and /settz.",
-        reply_markup=build_keyboard(None),
-    )
+        if not bool(user.get("allowlisted")):
+            await reply(update, context, "Registered. Waiting for approval.")
+            status = "rejected"
+            return
+
+        await reply(
+            update,
+            context,
+            "Welcome, you're active. Use /settime and /settz.",
+            reply_markup=build_keyboard(None),
+        )
+        status = "success"
+    finally:
+        record_command("start", status)
 
 
 async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_admin_override(update, context, "approve"):
-        return
-    chat_id = get_update_chat_id(update)
-    if chat_id is None:
-        return
-    if not context.args:
-        await reply(update, context, "Usage: /approve <telegram_user_id>")
-        return
+    status = "error"
     try:
-        target_user_id = int(context.args[0])
-    except ValueError:
-        await reply(update, context, "Invalid user id. Usage: /approve <telegram_user_id>")
-        return
+        if not await require_admin_override(update, context, "approve"):
+            status = "rejected"
+            return
+        chat_id = get_update_chat_id(update)
+        if chat_id is None:
+            status = "rejected"
+            return
+        if not context.args:
+            await reply(update, context, "Usage: /approve <telegram_user_id>")
+            status = "rejected"
+            return
+        try:
+            target_user_id = int(context.args[0])
+        except ValueError:
+            await reply(update, context, "Invalid user id. Usage: /approve <telegram_user_id>")
+            status = "rejected"
+            return
 
-    try:
-        row = approve_user(target_user_id)
-    except Exception as e:
-        await notify_error(context, chat_id, f"Failed to approve user {target_user_id}", e)
-        return
-    if row is None:
-        await reply(update, context, f"User not found: telegram_user_id={target_user_id}")
-        return
+        try:
+            row = approve_user(target_user_id)
+        except Exception as e:
+            await notify_error(context, chat_id, f"Failed to approve user {target_user_id}", e)
+            status = "error"
+            return
+        if row is None:
+            await reply(update, context, f"User not found: telegram_user_id={target_user_id}")
+            status = "rejected"
+            return
 
-    _log_bot_event(
-        "user_approved",
-        user_id=row["id"],
-        telegram_chat_id=row["telegram_chat_id"],
-    )
+        _log_bot_event(
+            "user_approved",
+            user_id=row["id"],
+            telegram_chat_id=row["telegram_chat_id"],
+        )
 
-    await reply(
-        update,
-        context,
-        (
-            f"✅ Approved telegram_user_id={row['telegram_user_id']}\n"
-            f"status={row['status']} allowlisted={row['allowlisted']}"
-        ),
-    )
+        await reply(
+            update,
+            context,
+            (
+                f"✅ Approved telegram_user_id={row['telegram_user_id']}\n"
+                f"status={row['status']} allowlisted={row['allowlisted']}"
+            ),
+        )
+        status = "success"
+    finally:
+        record_command("approve", status)
 
 
 async def cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_admin_override(update, context, "block"):
-        return
-    chat_id = get_update_chat_id(update)
-    if chat_id is None:
-        return
-    if not context.args:
-        await reply(update, context, "Usage: /block <telegram_user_id>")
-        return
+    status = "error"
     try:
-        target_user_id = int(context.args[0])
-    except ValueError:
-        await reply(update, context, "Invalid user id. Usage: /block <telegram_user_id>")
-        return
+        if not await require_admin_override(update, context, "block"):
+            status = "rejected"
+            return
+        chat_id = get_update_chat_id(update)
+        if chat_id is None:
+            status = "rejected"
+            return
+        if not context.args:
+            await reply(update, context, "Usage: /block <telegram_user_id>")
+            status = "rejected"
+            return
+        try:
+            target_user_id = int(context.args[0])
+        except ValueError:
+            await reply(update, context, "Invalid user id. Usage: /block <telegram_user_id>")
+            status = "rejected"
+            return
 
-    try:
-        row = block_user(target_user_id)
-    except Exception as e:
-        await notify_error(context, chat_id, f"Failed to block user {target_user_id}", e)
-        return
-    if row is None:
-        await reply(update, context, f"User not found: telegram_user_id={target_user_id}")
-        return
+        try:
+            row = block_user(target_user_id)
+        except Exception as e:
+            await notify_error(context, chat_id, f"Failed to block user {target_user_id}", e)
+            status = "error"
+            return
+        if row is None:
+            await reply(update, context, f"User not found: telegram_user_id={target_user_id}")
+            status = "rejected"
+            return
 
-    _log_bot_event(
-        "user_blocked",
-        user_id=row["id"],
-        telegram_chat_id=row["telegram_chat_id"],
-    )
+        _log_bot_event(
+            "user_blocked",
+            user_id=row["id"],
+            telegram_chat_id=row["telegram_chat_id"],
+        )
 
-    await reply(
-        update,
-        context,
-        (
-            f"⛔ Blocked telegram_user_id={row['telegram_user_id']}\n"
-            f"status={row['status']} allowlisted={row['allowlisted']}"
-        ),
-    )
+        await reply(
+            update,
+            context,
+            (
+                f"⛔ Blocked telegram_user_id={row['telegram_user_id']}\n"
+                f"status={row['status']} allowlisted={row['allowlisted']}"
+            ),
+        )
+        status = "success"
+    finally:
+        record_command("block", status)
 
 
 async def cmd_admin_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_admin_override(update, context, "admin_status"):
-        return
-    chat_id = get_update_chat_id(update)
-    if chat_id is None:
-        return
-
+    status = "error"
     try:
-        snapshot = get_admin_status_snapshot(pending_limit=20)
-    except Exception as e:
-        await notify_error(context, chat_id, "Failed to load admin status", e)
-        return
+        if not await require_admin_override(update, context, "admin_status"):
+            status = "rejected"
+            return
+        chat_id = get_update_chat_id(update)
+        if chat_id is None:
+            status = "rejected"
+            return
 
-    _log_bot_event("admin_status_requested", telegram_chat_id=chat_id)
+        try:
+            snapshot = get_admin_status_snapshot(pending_limit=20)
+        except Exception as e:
+            await notify_error(context, chat_id, "Failed to load admin status", e)
+            status = "error"
+            return
 
-    pending_users = snapshot["pending_users"]
-    lines = ["Pending users:"]
-    if pending_users:
-        for row in pending_users:
-            lines.append(
-                f"- tg_user={row['telegram_user_id']} chat={row['telegram_chat_id']} created={row['created_at']} username={row['username']}"
-            )
-    else:
-        lines.append("- none")
+        _log_bot_event("admin_status_requested", telegram_chat_id=chat_id)
 
-    lines.extend(
-        [
-            "",
-            f"Queued jobs count: {snapshot['queued_jobs_count']}",
-            f"Running jobs count: {snapshot['running_jobs_count']}",
-            f"Failed/dead jobs count: {snapshot['failed_dead_jobs_count']}",
-            "",
-            "Last delivery per user:",
-        ]
-    )
+        pending_users = snapshot["pending_users"]
+        lines = ["Pending users:"]
+        if pending_users:
+            for row in pending_users:
+                lines.append(
+                    f"- tg_user={row['telegram_user_id']} chat={row['telegram_chat_id']} created={row['created_at']} username={row['username']}"
+                )
+        else:
+            lines.append("- none")
 
-    last_deliveries = snapshot["last_delivery_per_user"]
-    if last_deliveries:
-        for row in last_deliveries:
-            delivered_at = row.get("delivered_at")
-            delivered_text = _fmt_ts(delivered_at, context.application.bot_data["tz"]) if delivered_at else "n/a"
-            lines.append(
-                f"- user={row['user_id']} tg_user={row['telegram_user_id']} chat={row['telegram_chat_id']} "
-                f"last={delivered_text} album={row.get('album_id') or 'n/a'} cycle={row.get('cycle_number') or 'n/a'}"
-            )
-    else:
-        lines.append("- none")
+        lines.extend(
+            [
+                "",
+                f"Queued jobs count: {snapshot['queued_jobs_count']}",
+                f"Running jobs count: {snapshot['running_jobs_count']}",
+                f"Failed/dead jobs count: {snapshot['failed_dead_jobs_count']}",
+                "",
+                "Last delivery per user:",
+            ]
+        )
 
-    await reply(update, context, "\n".join(lines))
+        last_deliveries = snapshot["last_delivery_per_user"]
+        if last_deliveries:
+            for row in last_deliveries:
+                delivered_at = row.get("delivered_at")
+                delivered_text = _fmt_ts(delivered_at, context.application.bot_data["tz"]) if delivered_at else "n/a"
+                lines.append(
+                    f"- user={row['user_id']} tg_user={row['telegram_user_id']} chat={row['telegram_chat_id']} "
+                    f"last={delivered_text} album={row.get('album_id') or 'n/a'} cycle={row.get('cycle_number') or 'n/a'}"
+                )
+        else:
+            lines.append("- none")
+
+        await reply(update, context, "\n".join(lines))
+        status = "success"
+    finally:
+        record_command("admin_status", status)
 
 
 async def cmd_settz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = await require_allowlisted_user(update, context, "settz")
-    if user is None:
-        return
-    chat_id = get_update_chat_id(update)
-    if chat_id is None:
-        return
-    if not context.args:
-        await reply(update, context, "Usage: /settz <IANA_TZ>\nExample: /settz Europe/Riga")
-        return
-
-    tz_name = context.args[0].strip()
+    status = "error"
     try:
-        ZoneInfo(tz_name)
-    except ZoneInfoNotFoundError:
+        user = await require_allowlisted_user(update, context, "settz")
+        if user is None:
+            status = "rejected"
+            return
+        chat_id = get_update_chat_id(update)
+        if chat_id is None:
+            status = "rejected"
+            return
+        if not context.args:
+            await reply(update, context, "Usage: /settz <IANA_TZ>\nExample: /settz Europe/Riga")
+            status = "rejected"
+            return
+
+        tz_name = context.args[0].strip()
+        try:
+            ZoneInfo(tz_name)
+        except ZoneInfoNotFoundError:
+            await reply(
+                update,
+                context,
+                "Invalid timezone. Use IANA format, for example: Europe/Riga",
+            )
+            status = "rejected"
+            return
+
+        try:
+            settings = set_user_timezone(user["id"], tz_name)
+        except Exception as e:
+            await notify_error(context, chat_id, "Failed to save timezone", e)
+            status = "error"
+            return
+
+        _log_bot_event(
+            "schedule_updated",
+            message=f"schedule_updated field=timezone timezone={settings['timezone']}",
+            user_id=user["id"],
+            telegram_chat_id=chat_id,
+        )
+
         await reply(
             update,
             context,
-            "Invalid timezone. Use IANA format, for example: Europe/Riga",
+            f"✅ Timezone saved: {settings['timezone']}\nDaily time: {settings['daily_time_local']}",
         )
-        return
-
-    try:
-        settings = set_user_timezone(user["id"], tz_name)
-    except Exception as e:
-        await notify_error(context, chat_id, "Failed to save timezone", e)
-        return
-
-    _log_bot_event(
-        "schedule_updated",
-        message=f"schedule_updated field=timezone timezone={settings['timezone']}",
-        user_id=user["id"],
-        telegram_chat_id=chat_id,
-    )
-
-    await reply(
-        update,
-        context,
-        f"✅ Timezone saved: {settings['timezone']}\nDaily time: {settings['daily_time_local']}",
-    )
+        status = "success"
+    finally:
+        record_command("settz", status)
 
 
 async def cmd_settime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = await require_allowlisted_user(update, context, "settime")
-    if user is None:
-        return
-    chat_id = get_update_chat_id(update)
-    if chat_id is None:
-        return
-    if not context.args:
-        await reply(update, context, "Usage: /settime <HH:MM>\nExample: /settime 07:30")
-        return
-
-    raw_time = context.args[0].strip()
+    status = "error"
     try:
-        parsed_time = parse_time_hhmm(raw_time)
-    except ValueError:
-        await reply(update, context, "Invalid time. Use HH:MM (24h), for example: 07:30")
-        return
+        user = await require_allowlisted_user(update, context, "settime")
+        if user is None:
+            status = "rejected"
+            return
+        chat_id = get_update_chat_id(update)
+        if chat_id is None:
+            status = "rejected"
+            return
+        if not context.args:
+            await reply(update, context, "Usage: /settime <HH:MM>\nExample: /settime 07:30")
+            status = "rejected"
+            return
 
-    try:
-        settings = set_user_daily_time(user["id"], parsed_time)
-    except Exception as e:
-        await notify_error(context, chat_id, "Failed to save daily time", e)
-        return
+        raw_time = context.args[0].strip()
+        try:
+            parsed_time = parse_time_hhmm(raw_time)
+        except ValueError:
+            await reply(update, context, "Invalid time. Use HH:MM (24h), for example: 07:30")
+            status = "rejected"
+            return
 
-    _log_bot_event(
-        "schedule_updated",
-        message=f"schedule_updated field=daily_time_local daily_time_local={settings['daily_time_local']}",
-        user_id=user["id"],
-        telegram_chat_id=chat_id,
-    )
+        try:
+            settings = set_user_daily_time(user["id"], parsed_time)
+        except Exception as e:
+            await notify_error(context, chat_id, "Failed to save daily time", e)
+            status = "error"
+            return
 
-    await reply(
-        update,
-        context,
-        f"✅ Daily time saved: {settings['daily_time_local']}\nTimezone: {settings['timezone']}",
-    )
-
-
-async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = await require_allowlisted_user(update, context, "now")
-    if user is None:
-        return
-    chat_id = get_update_chat_id(update)
-    if chat_id is None:
-        return
-    if not await enforce_request_dedupe(update, context, "now"):
-        return
-    if not await enforce_rate_limit(update, context, "now", int(user["id"])):
-        return
-    if not await enforce_command_lock(update, context, "now", int(user["id"])):
-        return
-
-    _log_bot_event("command_now", user_id=user["id"], telegram_chat_id=chat_id)
-    idem_key = f"manual:{user['id']}:{uuid4()}"
-
-    try:
-        now_utc = datetime.now(timezone.utc)
-        row = enqueue_job_once(
-            idempotency_key=idem_key,
-            idempotency_expires_at=now_utc + timedelta(days=2),
-            job_id=uuid4(),
+        _log_bot_event(
+            "schedule_updated",
+            message=f"schedule_updated field=daily_time_local daily_time_local={settings['daily_time_local']}",
             user_id=user["id"],
-            job_type=JOB_TYPE_DELIVER_NOW,
-            run_at=now_utc,
-            payload={
-                "telegram_chat_id": chat_id,
-                "idempotency_key": idem_key,
-            },
+            telegram_chat_id=chat_id,
         )
-        if row is not None:
-            _log_bot_event(
-                "manual_delivery_requested",
-                user_id=user["id"],
-                telegram_chat_id=chat_id,
-                job_id=row.get("id"),
-                job_type=JOB_TYPE_DELIVER_NOW,
-                attempt=row.get("attempt"),
-                idempotency_key=idem_key,
-            )
-            await reply(update, context, "Queued ✅")
-        else:
-            _log_bot_event(
-                "manual_delivery_requested",
-                message="manual_delivery_requested duplicate=true",
-                user_id=user["id"],
-                telegram_chat_id=chat_id,
-                job_type=JOB_TYPE_DELIVER_NOW,
-                idempotency_key=idem_key,
-            )
-            await reply(update, context, "Expect the previous album to arrive soon 🙂")
-    except Exception as e:
-        await notify_error(context, chat_id, "Failed to queue /now delivery", e)
-        return
 
-
-async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = await require_allowlisted_user(update, context, "refresh")
-    if user is None:
-        return
-    chat_id = get_update_chat_id(update)
-    if chat_id is None:
-        return
-    if not await enforce_request_dedupe(update, context, "refresh"):
-        return
-    if not await enforce_rate_limit(update, context, "refresh", int(user["id"])):
-        return
-    if not await enforce_command_lock(update, context, "refresh", int(user["id"])):
-        return
-
-    _log_bot_event("command_refresh", user_id=user["id"], telegram_chat_id=chat_id)
-
-    provider_account = get_active_user_provider_account(user["id"])
-    if provider_account is None:
-        await reply(update, context, "No active provider account is configured yet.")
-        return
-    if str(provider_account.get("status") or "") != PROVIDER_ACCOUNT_STATUS_CONNECTED:
         await reply(
             update,
             context,
-            f"Active provider cannot sync right now (status={provider_account.get('status')}).",
+            f"✅ Daily time saved: {settings['daily_time_local']}\nTimezone: {settings['timezone']}",
         )
-        return
+        status = "success"
+    finally:
+        record_command("settime", status)
 
-    idem_key = f"sync:{provider_account['id']}:{uuid4()}"
+
+async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    status = "error"
     try:
-        now_utc = datetime.now(timezone.utc)
-        row = enqueue_job_once(
-            idempotency_key=idem_key,
-            idempotency_expires_at=now_utc + timedelta(minutes=30),
-            job_id=uuid4(),
-            user_id=user["id"],
-            job_type=JOB_TYPE_SYNC_LIBRARY,
-            run_at=now_utc,
-            payload={
-                "telegram_chat_id": chat_id,
-                "idempotency_key": idem_key,
-                "user_provider_account_id": int(provider_account["id"]),
-                "provider": provider_account["provider"],
-            },
-        )
-        if row is not None:
-            await reply(update, context, "Queued ✅ Library sync will run soon", reply_markup=build_keyboard(None))
-        else:
-            await reply(update, context, "A sync is already queued or running for your library 🙂")
-    except Exception as e:
-        await notify_error(context, chat_id, "Failed to queue library sync", e)
+        user = await require_allowlisted_user(update, context, "now")
+        if user is None:
+            status = "rejected"
+            return
+        chat_id = get_update_chat_id(update)
+        if chat_id is None:
+            status = "rejected"
+            return
+        if not await enforce_request_dedupe(update, context, "now"):
+            status = "rejected"
+            return
+        if not await enforce_rate_limit(update, context, "now", int(user["id"])):
+            status = "rejected"
+            return
+        if not await enforce_command_lock(update, context, "now", int(user["id"])):
+            status = "rejected"
+            return
+
+        _log_bot_event("command_now", user_id=user["id"], telegram_chat_id=chat_id)
+        idem_key = f"manual:{user['id']}:{uuid4()}"
+
+        try:
+            now_utc = datetime.now(timezone.utc)
+            row = enqueue_job_once(
+                idempotency_key=idem_key,
+                idempotency_expires_at=now_utc + timedelta(days=2),
+                job_id=uuid4(),
+                user_id=user["id"],
+                job_type=JOB_TYPE_DELIVER_NOW,
+                run_at=now_utc,
+                payload={
+                    "telegram_chat_id": chat_id,
+                    "idempotency_key": idem_key,
+                },
+            )
+            if row is not None:
+                _log_bot_event(
+                    "manual_delivery_requested",
+                    user_id=user["id"],
+                    telegram_chat_id=chat_id,
+                    job_id=row.get("id"),
+                    job_type=JOB_TYPE_DELIVER_NOW,
+                    attempt=row.get("attempt"),
+                    idempotency_key=idem_key,
+                )
+                await reply(update, context, "Queued ✅")
+                status = "success"
+            else:
+                _log_bot_event(
+                    "manual_delivery_requested",
+                    message="manual_delivery_requested duplicate=true",
+                    user_id=user["id"],
+                    telegram_chat_id=chat_id,
+                    job_type=JOB_TYPE_DELIVER_NOW,
+                    idempotency_key=idem_key,
+                )
+                await reply(update, context, "Expect the previous album to arrive soon 🙂")
+                status = "rejected"
+        except Exception as e:
+            await notify_error(context, chat_id, "Failed to queue /now delivery", e)
+            status = "error"
+            return
+    finally:
+        record_command("now", status)
+
+
+async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    status = "error"
+    try:
+        user = await require_allowlisted_user(update, context, "refresh")
+        if user is None:
+            status = "rejected"
+            return
+        chat_id = get_update_chat_id(update)
+        if chat_id is None:
+            status = "rejected"
+            return
+        if not await enforce_request_dedupe(update, context, "refresh"):
+            status = "rejected"
+            return
+        if not await enforce_rate_limit(update, context, "refresh", int(user["id"])):
+            status = "rejected"
+            return
+        if not await enforce_command_lock(update, context, "refresh", int(user["id"])):
+            status = "rejected"
+            return
+
+        _log_bot_event("command_refresh", user_id=user["id"], telegram_chat_id=chat_id)
+
+        provider_account = get_active_user_provider_account(user["id"])
+        if provider_account is None:
+            await reply(update, context, "No active provider account is configured yet.")
+            status = "rejected"
+            return
+        if str(provider_account.get("status") or "") != PROVIDER_ACCOUNT_STATUS_CONNECTED:
+            await reply(
+                update,
+                context,
+                f"Active provider cannot sync right now (status={provider_account.get('status')}).",
+            )
+            status = "rejected"
+            return
+
+        idem_key = f"sync:{provider_account['id']}:{uuid4()}"
+        try:
+            now_utc = datetime.now(timezone.utc)
+            row = enqueue_job_once(
+                idempotency_key=idem_key,
+                idempotency_expires_at=now_utc + timedelta(minutes=30),
+                job_id=uuid4(),
+                user_id=user["id"],
+                job_type=JOB_TYPE_SYNC_LIBRARY,
+                run_at=now_utc,
+                payload={
+                    "telegram_chat_id": chat_id,
+                    "idempotency_key": idem_key,
+                    "user_provider_account_id": int(provider_account["id"]),
+                    "provider": provider_account["provider"],
+                },
+            )
+            if row is not None:
+                await reply(update, context, "Queued ✅ Library sync will run soon", reply_markup=build_keyboard(None))
+                status = "success"
+            else:
+                await reply(update, context, "A sync is already queued or running for your library 🙂")
+                status = "rejected"
+        except Exception as e:
+            await notify_error(context, chat_id, "Failed to queue library sync", e)
+            status = "error"
+    finally:
+        record_command("refresh", status)
 
 
 async def cmd_provider(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = await require_allowlisted_user(update, context, "provider")
-    if user is None:
-        return
-    chat_id = get_update_chat_id(update)
-    if chat_id is None:
-        return
-
+    status = "error"
     try:
-        accounts = list_user_provider_accounts(user["id"])
-    except Exception as e:
-        await notify_error(context, chat_id, "Failed to load provider accounts", e)
-        return
+        user = await require_allowlisted_user(update, context, "provider")
+        if user is None:
+            status = "rejected"
+            return
+        chat_id = get_update_chat_id(update)
+        if chat_id is None:
+            status = "rejected"
+            return
 
-    if not accounts:
-        await reply(update, context, "No provider accounts are configured yet.")
-        return
+        try:
+            accounts = list_user_provider_accounts(user["id"])
+        except Exception as e:
+            await notify_error(context, chat_id, "Failed to load provider accounts", e)
+            status = "error"
+            return
 
-    if not context.args:
-        lines = ["Providers:"]
-        for account in accounts:
-            marker = "*" if account.get("is_active") else "-"
-            lines.append(f"{marker} {account.get('provider')} status={account.get('status')}")
-        lines.append("")
-        lines.append("Usage: /provider <provider_name>")
-        await reply(update, context, "\n".join(lines))
-        return
+        if not accounts:
+            await reply(update, context, "No provider accounts are configured yet.")
+            status = "rejected"
+            return
 
-    target_provider = context.args[0].strip().lower()
-    try:
-        account = set_active_user_provider_account(user["id"], target_provider)
-    except Exception as e:
-        await notify_error(context, chat_id, "Failed to switch provider", e)
-        return
+        if not context.args:
+            lines = ["Providers:"]
+            for account in accounts:
+                marker = "*" if account.get("is_active") else "-"
+                lines.append(f"{marker} {account.get('provider')} status={account.get('status')}")
+            lines.append("")
+            lines.append("Usage: /provider <provider_name>")
+            await reply(update, context, "\n".join(lines))
+            status = "success"
+            return
 
-    if account is None:
-        await reply(update, context, f"Provider not found: {target_provider}")
-        return
+        target_provider = context.args[0].strip().lower()
+        try:
+            account = set_active_user_provider_account(user["id"], target_provider)
+        except Exception as e:
+            await notify_error(context, chat_id, "Failed to switch provider", e)
+            status = "error"
+            return
 
-    await reply(
-        update,
-        context,
-        f"✅ Active provider set to {account['provider']} (status={account['status']})",
-    )
+        if account is None:
+            await reply(update, context, f"Provider not found: {target_provider}")
+            status = "rejected"
+            return
+
+        await reply(
+            update,
+            context,
+            f"✅ Active provider set to {account['provider']} (status={account['status']})",
+        )
+        status = "success"
+    finally:
+        record_command("provider", status)
 
 
 async def cmd_connect_ytmusic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = await require_allowlisted_user(update, context, "connect_ytmusic")
-    if user is None:
-        return
-    await reply(
-        update,
-        context,
-        "YT Music connection is still manual in Phase 2.\nSend the credential blob to the admin so it can be stored for your account.",
-    )
+    status = "error"
+    try:
+        user = await require_allowlisted_user(update, context, "connect_ytmusic")
+        if user is None:
+            status = "rejected"
+            return
+        await reply(
+            update,
+            context,
+            "YT Music connection is still manual in Phase 2.\nSend the credential blob to the admin so it can be stored for your account.",
+        )
+        status = "success"
+    finally:
+        record_command("connect_ytmusic", status)
 
 
 async def cmd_connect_spotify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = await require_allowlisted_user(update, context, "connect_spotify")
-    if user is None:
-        return
-    await reply(update, context, "Spotify connection is not implemented yet.")
+    status = "error"
+    try:
+        user = await require_allowlisted_user(update, context, "connect_spotify")
+        if user is None:
+            status = "rejected"
+            return
+        await reply(update, context, "Spotify connection is not implemented yet.")
+        status = "success"
+    finally:
+        record_command("connect_spotify", status)
 
 
 async def cmd_nextcycle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = await require_allowlisted_user(update, context, "nextcycle")
-    if user is None:
-        return
-    chat_id = get_update_chat_id(update)
-    if chat_id is None:
-        return
-    if not await enforce_request_dedupe(update, context, "nextcycle"):
-        return
-    if not await enforce_rate_limit(update, context, "nextcycle", int(user["id"])):
-        return
-    if not await enforce_command_lock(update, context, "nextcycle", int(user["id"])):
-        return
-
-    _log_bot_event("command_nextcycle", user_id=user["id"], telegram_chat_id=chat_id)
-    idem_key = f"nextcycle:{user['id']}:{uuid4()}"
+    status = "error"
     try:
-        now_utc = datetime.now(timezone.utc)
-        row = enqueue_job_once(
-            idempotency_key=idem_key,
-            idempotency_expires_at=now_utc + timedelta(days=2),
-            job_id=uuid4(),
-            user_id=user["id"],
-            job_type=JOB_TYPE_NEXT_CYCLE_NOW,
-            run_at=now_utc,
-            payload={
-                "telegram_chat_id": chat_id,
-                "idempotency_key": idem_key,
-                "force_next_cycle": True,
-            },
-        )
-        if row is not None:
-            _log_bot_event(
-                "manual_delivery_requested",
-                message="manual_delivery_requested force_next_cycle=true",
-                user_id=user["id"],
-                telegram_chat_id=chat_id,
-                job_id=row.get("id"),
-                job_type=JOB_TYPE_NEXT_CYCLE_NOW,
-                attempt=row.get("attempt"),
+        user = await require_allowlisted_user(update, context, "nextcycle")
+        if user is None:
+            status = "rejected"
+            return
+        chat_id = get_update_chat_id(update)
+        if chat_id is None:
+            status = "rejected"
+            return
+        if not await enforce_request_dedupe(update, context, "nextcycle"):
+            status = "rejected"
+            return
+        if not await enforce_rate_limit(update, context, "nextcycle", int(user["id"])):
+            status = "rejected"
+            return
+        if not await enforce_command_lock(update, context, "nextcycle", int(user["id"])):
+            status = "rejected"
+            return
+
+        _log_bot_event("command_nextcycle", user_id=user["id"], telegram_chat_id=chat_id)
+        idem_key = f"nextcycle:{user['id']}:{uuid4()}"
+        try:
+            now_utc = datetime.now(timezone.utc)
+            row = enqueue_job_once(
                 idempotency_key=idem_key,
-            )
-            await reply(update, context, "Queued ✅ New cycle album will arrive soon")
-        else:
-            _log_bot_event(
-                "manual_delivery_requested",
-                message="manual_delivery_requested duplicate=true force_next_cycle=true",
+                idempotency_expires_at=now_utc + timedelta(days=2),
+                job_id=uuid4(),
                 user_id=user["id"],
-                telegram_chat_id=chat_id,
                 job_type=JOB_TYPE_NEXT_CYCLE_NOW,
-                idempotency_key=idem_key,
+                run_at=now_utc,
+                payload={
+                    "telegram_chat_id": chat_id,
+                    "idempotency_key": idem_key,
+                    "force_next_cycle": True,
+                },
             )
-            await reply(update, context, "Expect the previous new-cycle album to arrive soon 🙂")
-    except Exception as e:
-        await notify_error(context, chat_id, "Failed to queue /nextcycle delivery", e)
-        return
+            if row is not None:
+                _log_bot_event(
+                    "manual_delivery_requested",
+                    message="manual_delivery_requested force_next_cycle=true",
+                    user_id=user["id"],
+                    telegram_chat_id=chat_id,
+                    job_id=row.get("id"),
+                    job_type=JOB_TYPE_NEXT_CYCLE_NOW,
+                    attempt=row.get("attempt"),
+                    idempotency_key=idem_key,
+                )
+                await reply(update, context, "Queued ✅ New cycle album will arrive soon")
+                status = "success"
+            else:
+                _log_bot_event(
+                    "manual_delivery_requested",
+                    message="manual_delivery_requested duplicate=true force_next_cycle=true",
+                    user_id=user["id"],
+                    telegram_chat_id=chat_id,
+                    job_type=JOB_TYPE_NEXT_CYCLE_NOW,
+                    idempotency_key=idem_key,
+                )
+                await reply(update, context, "Expect the previous new-cycle album to arrive soon 🙂")
+                status = "rejected"
+        except Exception as e:
+            await notify_error(context, chat_id, "Failed to queue /nextcycle delivery", e)
+            status = "error"
+            return
+    finally:
+        record_command("nextcycle", status)
 
 def _fmt_ts(ts: Optional[Any], tz: ZoneInfo) -> str:
     if not ts:
@@ -1066,67 +1189,76 @@ def resolve_app_timezone(
     return ZoneInfo(timezone_name)
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = await require_allowlisted_user(update, context, "status")
-    if user is None:
-        return
-    chat_id = get_update_chat_id(update)
-    if chat_id is None:
-        return
-
-    _log_bot_event("command_status", user_id=user["id"], telegram_chat_id=chat_id)
-
-    tz = context.application.bot_data["tz"]
+    status = "error"
     try:
-        provider_account = get_active_user_provider_account(user["id"])
-        settings = get_user_settings(user["id"])
-        db_stats = get_user_delivery_stats(user["id"])
-        recent_deliveries = list_recent_deliveries(user["id"], limit=5)
-    except Exception as e:
-        await notify_error(context, chat_id, "Failed to load DB status", e)
-        return
-
-    sync_state = None
-    if provider_account is not None:
-        try:
-            sync_state = get_user_provider_sync_state(int(provider_account["id"]))
-        except Exception as e:
-            await notify_error(context, chat_id, "Failed to load provider sync status", e)
+        user = await require_allowlisted_user(update, context, "status")
+        if user is None:
+            status = "rejected"
+            return
+        chat_id = get_update_chat_id(update)
+        if chat_id is None:
+            status = "rejected"
             return
 
-    _log_bot_event(
-        "status_snapshot",
-        message="status_snapshot",
-        user_id=user["id"],
-        telegram_chat_id=chat_id,
-    )
+        _log_bot_event("command_status", user_id=user["id"], telegram_chat_id=chat_id)
 
-    msg_lines = [
-        "DB user:",
-        f"Access: allowlisted={user.get('allowlisted')} status={user.get('status')}",
-        f"Timezone: {settings.get('timezone')}",
-        f"Daily time: {settings.get('daily_time_local')}",
-        f"Active provider: {(provider_account or {}).get('provider') or 'n/a'}",
-        f"Provider status: {(provider_account or {}).get('status') or 'n/a'}",
-        f"Last sync result: {(sync_state or {}).get('last_sync_result') or 'n/a'}",
-        f"Last sync: {_fmt_ts((sync_state or {}).get('last_successful_sync_at'), tz)}",
-        f"Last sync error: {(sync_state or {}).get('last_error') or 'n/a'}",
-        f"Cached albums: {(sync_state or {}).get('library_item_count') or 0}",
-        f"DB deliveries total: {db_stats.get('total_deliveries')}",
-        f"DB latest cycle: {db_stats.get('latest_cycle_number') or 'n/a'}",
-        f"DB sent in latest cycle: {db_stats.get('latest_cycle_count')}",
-        f"DB last delivered: {_fmt_ts(db_stats.get('last_delivered_at'), tz)}",
-        "",
-        "Recent DB deliveries:",
-    ]
-    if recent_deliveries:
-        for row in recent_deliveries:
-            msg_lines.append(
-                f"- {_fmt_ts(row.get('delivered_at'), tz)} album={row.get('album_id')} cycle={row.get('cycle_number')}"
-            )
-    else:
-        msg_lines.append("- none")
+        tz = context.application.bot_data["tz"]
+        try:
+            provider_account = get_active_user_provider_account(user["id"])
+            settings = get_user_settings(user["id"])
+            db_stats = get_user_delivery_stats(user["id"])
+            recent_deliveries = list_recent_deliveries(user["id"], limit=5)
+        except Exception as e:
+            await notify_error(context, chat_id, "Failed to load DB status", e)
+            status = "error"
+            return
 
-    await reply(update, context, "\n".join(msg_lines), reply_markup=build_keyboard(None))
+        sync_state = None
+        if provider_account is not None:
+            try:
+                sync_state = get_user_provider_sync_state(int(provider_account["id"]))
+            except Exception as e:
+                await notify_error(context, chat_id, "Failed to load provider sync status", e)
+                status = "error"
+                return
+
+        _log_bot_event(
+            "status_snapshot",
+            message="status_snapshot",
+            user_id=user["id"],
+            telegram_chat_id=chat_id,
+        )
+
+        msg_lines = [
+            "DB user:",
+            f"Access: allowlisted={user.get('allowlisted')} status={user.get('status')}",
+            f"Timezone: {settings.get('timezone')}",
+            f"Daily time: {settings.get('daily_time_local')}",
+            f"Active provider: {(provider_account or {}).get('provider') or 'n/a'}",
+            f"Provider status: {(provider_account or {}).get('status') or 'n/a'}",
+            f"Last sync result: {(sync_state or {}).get('last_sync_result') or 'n/a'}",
+            f"Last sync: {_fmt_ts((sync_state or {}).get('last_successful_sync_at'), tz)}",
+            f"Last sync error: {(sync_state or {}).get('last_error') or 'n/a'}",
+            f"Cached albums: {(sync_state or {}).get('library_item_count') or 0}",
+            f"DB deliveries total: {db_stats.get('total_deliveries')}",
+            f"DB latest cycle: {db_stats.get('latest_cycle_number') or 'n/a'}",
+            f"DB sent in latest cycle: {db_stats.get('latest_cycle_count')}",
+            f"DB last delivered: {_fmt_ts(db_stats.get('last_delivered_at'), tz)}",
+            "",
+            "Recent DB deliveries:",
+        ]
+        if recent_deliveries:
+            for row in recent_deliveries:
+                msg_lines.append(
+                    f"- {_fmt_ts(row.get('delivered_at'), tz)} album={row.get('album_id')} cycle={row.get('cycle_number')}"
+                )
+        else:
+            msg_lines.append("- none")
+
+        await reply(update, context, "\n".join(msg_lines), reply_markup=build_keyboard(None))
+        status = "success"
+    finally:
+        record_command("status", status)
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1187,6 +1319,7 @@ def main() -> None:
         raise RuntimeError("redis package is not installed")
 
     configure_logging(log_level)
+    start_metrics_server(get_optional_env_int("PROMETHEUS_METRICS_PORT") or 8000)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     _log_bot_event(

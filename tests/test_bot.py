@@ -287,6 +287,26 @@ class RateLimitTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(allowed)
         update.message.reply_text.assert_awaited_once()
 
+    async def test_enforce_rate_limit_records_metric_when_breached(self) -> None:
+        redis_client = SimpleNamespace(
+            incr=AsyncMock(side_effect=[7]),
+            expire=AsyncMock(),
+            ttl=AsyncMock(return_value=59),
+        )
+        context = SimpleNamespace(application=SimpleNamespace(bot_data={"redis": redis_client}))
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=99),
+            callback_query=None,
+            message=SimpleNamespace(reply_text=AsyncMock()),
+            effective_user=SimpleNamespace(id=42),
+        )
+
+        with patch("bot.record_rate_limit_hit") as record_rate_limit_hit:
+            allowed = await enforce_rate_limit(update, context, "now", 42)
+
+        self.assertFalse(allowed)
+        record_rate_limit_hit.assert_called_once_with("now")
+
 
 class FmtTsTests(unittest.TestCase):
     def test_returns_na_for_missing_timestamp(self) -> None:

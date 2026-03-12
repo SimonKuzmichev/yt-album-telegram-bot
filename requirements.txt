@@ -7,3 +7,4 @@ requests[socks]==2.32.5
 ruff==0.15.5
 psycopg[binary,pool]==3.3.3
 redis[hiredis]==6.4.0
+prometheus-client==0.23.1

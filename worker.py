@@ -4,6 +4,7 @@ import os
 import random
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from time import perf_counter
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -21,6 +22,7 @@ from src.db import (
     enqueue_job_once,
     get_active_user_provider_account,
     get_latest_cycle_number,
+    get_metrics_snapshot,
     get_user_provider_account_by_id,
     get_user_provider_account_credentials,
     insert_delivery_history,
@@ -39,6 +41,19 @@ from src.db import (
 )
 from src.errors import is_auth_error, is_rate_limited
 from src.logging_utils import configure_logging, log_event
+from src.metrics import (
+    album_deliveries_total,
+    classify_error,
+    delivery_attempts_total,
+    delivery_duration_seconds,
+    delivery_failures_total,
+    normalize_provider,
+    provider_sync_duration_seconds,
+    provider_sync_failures_total,
+    provider_sync_total,
+    start_metrics_server,
+    update_runtime_snapshot,
+)
 from src.providers import build_provider_client
 from src.telegram_delivery import send_album_message
 
@@ -280,9 +295,14 @@ def _sync_log_fields(
 
 def _sync_provider_account(cfg: WorkerConfig, account: dict, sync_job_id: UUID | None = None) -> list[dict]:
     account_id = int(account["id"])
+    provider = normalize_provider(account.get("provider"))
+    started = perf_counter()
     sync_fields = _sync_log_fields(account=account, sync_job_id=sync_job_id)
     credentials = get_user_provider_account_credentials(account_id)
     if not credentials:
+        provider_sync_total.labels(provider=provider, status="error").inc()
+        provider_sync_failures_total.labels(provider=provider, error_type="credentials_missing").inc()
+        provider_sync_duration_seconds.observe(perf_counter() - started)
         raise RuntimeError("Provider credentials are not configured")
 
     mark_user_provider_sync_started(account_id)
@@ -314,13 +334,17 @@ def _sync_provider_account(cfg: WorkerConfig, account: dict, sync_job_id: UUID |
                 rate_limited=False,
             ),
         )
+        provider_sync_total.labels(provider=provider, status=result_status).inc()
+        provider_sync_duration_seconds.observe(perf_counter() - started)
         return albums
     except Exception as exc:
+        error_type = "rate_limited" if is_rate_limited(exc) else classify_error(exc)
         if is_auth_error(exc):
             result_status = SYNC_RESULT_AUTH_ERROR
             next_provider_status = PROVIDER_ACCOUNT_STATUS_NEEDS_REAUTH
             mark_user_provider_sync_failed(account_id, str(exc), result_status=result_status)
             mark_user_provider_account_status(account_id, next_provider_status)
+            error_type = SYNC_RESULT_AUTH_ERROR
         else:
             result_status = SYNC_RESULT_TRANSIENT_ERROR
             next_provider_status = str(account.get("status") or "")
@@ -338,6 +362,9 @@ def _sync_provider_account(cfg: WorkerConfig, account: dict, sync_job_id: UUID |
                 rate_limited=is_rate_limited(exc),
             ),
         )
+        provider_sync_total.labels(provider=provider, status=result_status).inc()
+        provider_sync_failures_total.labels(provider=provider, error_type=error_type).inc()
+        provider_sync_duration_seconds.observe(perf_counter() - started)
         raise
 
 
@@ -358,66 +385,81 @@ async def _execute_delivery_job(bot: Bot, cfg: WorkerConfig, job: dict) -> None:
     chat_id = int(payload["telegram_chat_id"])
     job_type = str(job["job_type"])
     force_next_cycle = bool(payload.get("force_next_cycle")) or job_type == JOB_TYPE_NEXT_CYCLE_NOW
+    account = get_active_user_provider_account(user_id)
+    provider = normalize_provider((account or {}).get("provider"))
+    started = perf_counter()
+    delivery_attempts_total.labels(provider=provider).inc()
 
-    albums = _get_delivery_albums(cfg, user_id)
-    if not albums:
-        raise RuntimeError("Library is empty")
+    try:
+        albums = _get_delivery_albums(cfg, user_id)
+        if not albums:
+            raise RuntimeError("Library is empty")
 
-    # Cycle semantics:
-    # - default: keep current cycle_number until exhausted, then rotate
-    # - force_next_cycle: immediately transition to next cycle_number
-    latest_cycle_number = get_latest_cycle_number(user_id) or 0
-    current_cycle_number = (latest_cycle_number + 1) if force_next_cycle else max(latest_cycle_number, 1)
+        # Cycle semantics:
+        # - default: keep current cycle_number until exhausted, then rotate
+        # - force_next_cycle: immediately transition to next cycle_number
+        latest_cycle_number = get_latest_cycle_number(user_id) or 0
+        current_cycle_number = (latest_cycle_number + 1) if force_next_cycle else max(latest_cycle_number, 1)
 
-    eligible = [a for a in albums if a.get("provider_album_id")]
-    delivered_ids = set(list_cycle_album_ids(user_id=user_id, cycle_number=current_cycle_number))
-    unsent = [a for a in eligible if str(a.get("provider_album_id")) not in delivered_ids]
+        eligible = [a for a in albums if a.get("provider_album_id")]
+        delivered_ids = set(list_cycle_album_ids(user_id=user_id, cycle_number=current_cycle_number))
+        unsent = [a for a in eligible if str(a.get("provider_album_id")) not in delivered_ids]
 
-    if not unsent and not force_next_cycle:
-        current_cycle_number += 1
-        unsent = eligible
+        if not unsent and not force_next_cycle:
+            current_cycle_number += 1
+            unsent = eligible
 
-    if not unsent:
-        raise RuntimeError("No eligible albums available")
+        if not unsent:
+            raise RuntimeError("No eligible albums available")
 
-    selected_album = random.choice(unsent)
-    selected_album_id = str(selected_album.get("provider_album_id") or "")
-    if not selected_album_id:
-        raise RuntimeError("Selected album has no provider_album_id")
+        selected_album = random.choice(unsent)
+        selected_album_id = str(selected_album.get("provider_album_id") or "")
+        if not selected_album_id:
+            raise RuntimeError("Selected album has no provider_album_id")
 
-    # Rare race safety (multiple workers): if the chosen album is inserted by another
-    # worker first, retry with remaining unsent candidates.
-    reserved = insert_delivery_history(
-        user_id=user_id,
-        cycle_number=current_cycle_number,
-        album_id=selected_album_id,
-    )
-    if not reserved:
-        remaining = [a for a in unsent if str(a.get("provider_album_id")) != selected_album_id]
-        random.shuffle(remaining)
-        for candidate in remaining:
-            candidate_id = str(candidate.get("provider_album_id") or "")
-            if not candidate_id:
-                continue
-            if insert_delivery_history(
-                user_id=user_id,
-                cycle_number=current_cycle_number,
-                album_id=candidate_id,
-            ):
-                selected_album = candidate
-                reserved = True
-                break
+        # Rare race safety (multiple workers): if the chosen album is inserted by another
+        # worker first, retry with remaining unsent candidates.
+        reserved = insert_delivery_history(
+            user_id=user_id,
+            cycle_number=current_cycle_number,
+            album_id=selected_album_id,
+        )
+        if not reserved:
+            remaining = [a for a in unsent if str(a.get("provider_album_id")) != selected_album_id]
+            random.shuffle(remaining)
+            for candidate in remaining:
+                candidate_id = str(candidate.get("provider_album_id") or "")
+                if not candidate_id:
+                    continue
+                if insert_delivery_history(
+                    user_id=user_id,
+                    cycle_number=current_cycle_number,
+                    album_id=candidate_id,
+                ):
+                    selected_album = candidate
+                    reserved = True
+                    break
 
-    if not reserved:
-        raise RuntimeError("Could not reserve a unique album in current cycle")
+        if not reserved:
+            raise RuntimeError("Could not reserve a unique album in current cycle")
 
-    if job_type == JOB_TYPE_DAILY_DELIVER:
-        prefix = "📅 Daily album"
-    elif force_next_cycle:
-        prefix = "⏭️ New cycle album"
-    else:
-        prefix = "🎲 Album now"
-    await send_album_message(bot, chat_id=chat_id, album=selected_album, prefix=prefix)
+        if job_type == JOB_TYPE_DAILY_DELIVER:
+            prefix = "📅 Daily album"
+        elif force_next_cycle:
+            prefix = "⏭️ New cycle album"
+        else:
+            prefix = "🎲 Album now"
+        await send_album_message(bot, chat_id=chat_id, album=selected_album, prefix=prefix)
+        album_deliveries_total.labels(provider=provider, status="success").inc()
+    except Exception as exc:
+        album_deliveries_total.labels(provider=provider, status="failure").inc()
+        error_type = "rate_limited" if is_rate_limited(exc) else classify_error(exc)
+        if is_auth_error(exc):
+            error_type = SYNC_RESULT_AUTH_ERROR
+        delivery_failures_total.labels(provider=provider, error_type=error_type).inc()
+        raise
+    finally:
+        delivery_duration_seconds.observe(perf_counter() - started)
 
 
 def _execute_sync_job(cfg: WorkerConfig, job: dict) -> None:
@@ -571,6 +613,7 @@ async def process_claimed_jobs(bot: Bot, cfg: WorkerConfig) -> int:
 
 async def run_worker() -> None:
     cfg = _load_worker_config()
+    start_metrics_server(_get_env_int("WORKER_PROMETHEUS_METRICS_PORT", 8001))
     bot = Bot(token=cfg.bot_token)
     log_event(
         logger,
@@ -586,6 +629,7 @@ async def run_worker() -> None:
             sync_enqueued = enqueue_due_sync_jobs(cfg)
             requeued = requeue_stale_running_jobs(cfg.job_lease_seconds)
             processed = await process_claimed_jobs(bot, cfg)
+            update_runtime_snapshot(get_metrics_snapshot())
             if requeued:
                 log_event(
                     logger,

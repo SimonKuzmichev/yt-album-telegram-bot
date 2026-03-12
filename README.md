@@ -40,6 +40,8 @@ LIBRARY_LIMIT=500
 CREDENTIALS_MASTER_KEY=...
 
 DEFAULT_TIMEZONE=UTC
+PROMETHEUS_METRICS_PORT=8000
+WORKER_PROMETHEUS_METRICS_PORT=8001
 ```
 
 Notes:
@@ -51,6 +53,7 @@ Notes:
 - `DAILY_TIME` is no longer used.
 - `bot.py` resolves its app timezone from the admin override user's DB settings when that user exists; otherwise it falls back to `DEFAULT_TIMEZONE`.
 - `WORKER_JOB_LEASE_SECONDS` controls when `running` jobs are considered stale and requeued after a worker crash.
+- The bot exports Prometheus metrics on `PROMETHEUS_METRICS_PORT` and the worker exports on `WORKER_PROMETHEUS_METRICS_PORT`.
 
 ## Setup
 
@@ -121,3 +124,28 @@ python3 sripts/get_chat_id.py
 - No daily deliveries: verify the worker is running and the user has valid DB timezone and daily time settings.
 - Jobs stuck in `running`: verify `WORKER_JOB_LEASE_SECONDS` is appropriate for normal job duration and that the worker loop is running.
 - Unauthorized admin actions: verify `ALLOWED_CHAT_ID`.
+
+## Prometheus Metrics
+
+The bot process exposes command and rate-limit metrics, and the worker process exposes delivery, sync, and DB-backed gauge metrics. Scrape both endpoints if you want the full set.
+
+Worker metrics include:
+
+- `album_deliveries_total{provider,status}`
+- `delivery_attempts_total{provider}`
+- `delivery_failures_total{provider,error_type}`
+- `delivery_duration_seconds`
+- `provider_sync_total{provider,status}`
+- `provider_sync_failures_total{provider,error_type}`
+- `provider_sync_duration_seconds`
+- `provider_library_album_count{provider,user_id}`
+- `provider_accounts_total{provider,status}`
+- `provider_accounts_needs_reauth{provider}`
+- `job_queue_depth{type,status}`
+
+Bot metrics include:
+
+- `commands_total{command,status}`
+- `rate_limit_hits_total{command}`
+
+`token_refresh_failures_total{provider}` is registered for future provider token-refresh flows; the current codebase does not perform refreshes yet.

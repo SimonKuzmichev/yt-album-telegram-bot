@@ -22,3 +22,5 @@ export DATABASE_URL="$TEST_DATABASE_URL"
 alembic upgrade head
 psql postgresql://app:app@localhost:5432/postgres -c "\dt app.*"
 python -m unittest discover -s tests -v
+
+ruff check .

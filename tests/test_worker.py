@@ -21,6 +21,21 @@ from worker import (  # noqa: E402
 )
 
 
+class _MetricProbe:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def labels(self, **kwargs):
+        self.calls.append(("labels", kwargs))
+        return self
+
+    def inc(self) -> None:
+        self.calls.append(("inc", None))
+
+    def observe(self, value) -> None:
+        self.calls.append(("observe", value))
+
+
 class EnvHelperTests(unittest.TestCase):
     def test_get_env_int_uses_default_when_missing(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
@@ -112,6 +127,29 @@ class IsDueNowTests(unittest.TestCase):
 
 
 class SyncProviderAccountTests(unittest.TestCase):
+    def test_records_sync_success_metrics(self) -> None:
+        cfg = SimpleNamespace(library_limit=10)
+        account = {"id": 55, "provider": "ytmusic", "status": "connected"}
+        provider_client = SimpleNamespace(list_saved_albums=lambda limit=None: [{"provider_album_id": "a-1"}])
+        sync_total = _MetricProbe()
+        sync_failures = _MetricProbe()
+        sync_duration = _MetricProbe()
+
+        with patch.object(worker, "get_user_provider_account_credentials", return_value={"cookie_blob": "secret"}), \
+             patch.object(worker, "mark_user_provider_sync_started"), \
+             patch.object(worker, "build_provider_client", return_value=provider_client), \
+             patch.object(worker, "upsert_user_library_albums", return_value=1), \
+             patch.object(worker, "mark_user_provider_sync_succeeded"), \
+             patch.object(worker, "provider_sync_total", sync_total), \
+             patch.object(worker, "provider_sync_failures_total", sync_failures), \
+             patch.object(worker, "provider_sync_duration_seconds", sync_duration):
+            _sync_provider_account(cfg, account)
+
+        self.assertIn(("labels", {"provider": "ytmusic", "status": "ok"}), sync_total.calls)
+        self.assertIn(("inc", None), sync_total.calls)
+        self.assertFalse(any(call == ("inc", None) for call in sync_failures.calls))
+        self.assertEqual(sync_duration.calls[0][0], "observe")
+
     def test_marks_account_needs_reauth_on_auth_error(self) -> None:
         cfg = SimpleNamespace(library_limit=10)
         account = {"id": 55, "provider": "ytmusic", "status": "connected"}
@@ -124,7 +162,10 @@ class SyncProviderAccountTests(unittest.TestCase):
              patch.object(worker, "build_provider_client", return_value=provider_client), \
              patch.object(worker, "is_auth_error", return_value=True), \
              patch.object(worker, "mark_user_provider_sync_failed") as mark_failed, \
-             patch.object(worker, "mark_user_provider_account_status") as mark_status:
+             patch.object(worker, "mark_user_provider_account_status") as mark_status, \
+             patch.object(worker, "provider_sync_total", _MetricProbe()), \
+             patch.object(worker, "provider_sync_failures_total", _MetricProbe()), \
+             patch.object(worker, "provider_sync_duration_seconds", _MetricProbe()):
             with self.assertRaises(RuntimeError):
                 _sync_provider_account(cfg, account)
 
@@ -141,7 +182,10 @@ class SyncProviderAccountTests(unittest.TestCase):
              patch.object(worker, "build_provider_client", return_value=provider_client), \
              patch.object(worker, "upsert_user_library_albums", return_value=0), \
              patch.object(worker, "mark_user_provider_sync_succeeded") as mark_succeeded, \
-             patch.object(worker, "mark_user_provider_account_status") as mark_status:
+             patch.object(worker, "mark_user_provider_account_status") as mark_status, \
+             patch.object(worker, "provider_sync_total", _MetricProbe()), \
+             patch.object(worker, "provider_sync_failures_total", _MetricProbe()), \
+             patch.object(worker, "provider_sync_duration_seconds", _MetricProbe()):
             albums = _sync_provider_account(cfg, account)
 
         self.assertEqual(albums, [])
@@ -162,7 +206,10 @@ class SyncProviderAccountTests(unittest.TestCase):
              patch.object(worker, "is_auth_error", return_value=False), \
              patch.object(worker, "is_rate_limited", return_value=True), \
              patch.object(worker, "mark_user_provider_sync_failed"), \
-             patch.object(worker, "log_event") as log_event:
+             patch.object(worker, "log_event") as log_event, \
+             patch.object(worker, "provider_sync_total", _MetricProbe()), \
+             patch.object(worker, "provider_sync_failures_total", _MetricProbe()), \
+             patch.object(worker, "provider_sync_duration_seconds", _MetricProbe()):
             with self.assertRaises(RuntimeError):
                 _sync_provider_account(cfg, account, sync_job_id=sync_job_id)
 

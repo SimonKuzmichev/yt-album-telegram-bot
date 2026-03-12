@@ -67,6 +67,7 @@ def install_module_stubs() -> None:
             "ensure_user_settings",
             "get_active_user_provider_account",
             "get_admin_status_snapshot",
+            "get_metrics_snapshot",
             "get_user_provider_sync_state",
             "get_latest_cycle_number",
             "get_user_provider_account_by_id",
