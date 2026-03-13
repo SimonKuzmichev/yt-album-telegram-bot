@@ -133,6 +133,19 @@ def _load_worker_config() -> WorkerConfig:
     )
 
 
+def _refresh_runtime_metrics(cfg: WorkerConfig) -> None:
+    try:
+        update_runtime_snapshot(get_metrics_snapshot())
+    except Exception:
+        log_event(
+            logger,
+            logging.ERROR,
+            "runtime_metrics_refresh_failed",
+            exc_info=True,
+            worker_id=cfg.worker_id,
+        )
+
+
 def enqueue_due_jobs(cfg: WorkerConfig) -> int:
     now_utc = datetime.now(timezone.utc)
     users = list_active_users_with_delivery_context()
@@ -629,7 +642,6 @@ async def run_worker() -> None:
             sync_enqueued = enqueue_due_sync_jobs(cfg)
             requeued = requeue_stale_running_jobs(cfg.job_lease_seconds)
             processed = await process_claimed_jobs(bot, cfg)
-            update_runtime_snapshot(get_metrics_snapshot())
             if requeued:
                 log_event(
                     logger,
@@ -656,6 +668,7 @@ async def run_worker() -> None:
                 exc_info=True,
                 worker_id=cfg.worker_id,
             )
+        _refresh_runtime_metrics(cfg)
         await asyncio.sleep(cfg.poll_seconds)
 
 
