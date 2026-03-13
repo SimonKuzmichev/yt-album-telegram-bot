@@ -1,20 +1,23 @@
 # Daily YouTube Music Album Bot
 
-Telegram bot that sends one random album per day from your YouTube Music library. Delivery state is DB-backed, so albums do not repeat within a cycle until that user's current cycle is exhausted.
+Telegram bot that sends one random album per day from a user's saved music library. The current codebase uses PostgreSQL for persistent state, Redis for command locks and rate limiting, and a worker process for scheduled delivery and provider sync jobs.
 
 ## Features
 
-- DB-backed delivery history and cycle tracking
+- DB-backed delivery history, cycle tracking, and job queue
 - Worker-based daily scheduling per user timezone and local delivery time
+- Redis-backed command deduplication, short-term locks, and rate limiting
 - Manual commands: `/now`, `/nextcycle`, `/refresh`, `/status`
+- Admin commands: `/approve`, `/block`, `/admin_status`
 - Inline buttons: another album, refresh library, status, open album
-- Per-user provider account sync and album cache stored in PostgreSQL
-- Basic auth-expiration diagnostics for YT Music credentials
+- Per-user provider accounts, encrypted credentials, sync state, and album cache stored in PostgreSQL
+- Prometheus metrics for bot and worker, plus optional Grafana/Prometheus via Docker Compose
 
 ## Requirements
 
 - Python 3.11+
 - PostgreSQL
+- Redis
 - Docker Compose
 - Telegram bot token from BotFather
 - `CREDENTIALS_MASTER_KEY` for encrypted provider credentials at rest
@@ -34,6 +37,7 @@ Create `.env`:
 ```env
 BOT_TOKEN=...
 DATABASE_URL=postgresql://app:app@localhost:5432/ytabot
+REDIS_URL=redis://localhost:6379/0
 ALLOWED_CHAT_ID=123456789
 
 LIBRARY_LIMIT=500
@@ -42,25 +46,32 @@ CREDENTIALS_MASTER_KEY=...
 DEFAULT_TIMEZONE=UTC
 PROMETHEUS_METRICS_PORT=8000
 WORKER_PROMETHEUS_METRICS_PORT=8001
+WORKER_POLL_SECONDS=15
+WORKER_DUE_WINDOW_SECONDS=60
+WORKER_JOB_LEASE_SECONDS=300
+PROVIDER_SYNC_INTERVAL_SECONDS=21600
 ```
 
 Notes:
 
 - `DATABASE_URL` is required by both `bot.py` and `worker.py`.
+- `REDIS_URL` is required by `bot.py` for command locks, request dedupe, and rate limiting.
 - `ALLOWED_CHAT_ID` is only an admin override for admin-only commands such as `/approve`, `/block`, and `/admin_status`.
 - Daily scheduling is executed by `worker.py` using per-user settings stored in the DB.
 - `/refresh` now queues a sync for the calling user’s active provider account.
 - `DAILY_TIME` is no longer used.
 - `bot.py` resolves its app timezone from the admin override user's DB settings when that user exists; otherwise it falls back to `DEFAULT_TIMEZONE`.
 - `WORKER_JOB_LEASE_SECONDS` controls when `running` jobs are considered stale and requeued after a worker crash.
+- `PROVIDER_SYNC_INTERVAL_SECONDS` controls periodic background provider sync scheduling.
+- `NOW_RATE_LIMIT_HOURLY`, `NOW_RATE_LIMIT_DAILY`, `NEXTCYCLE_RATE_LIMIT_HOURLY`, `NEXTCYCLE_RATE_LIMIT_DAILY`, `REFRESH_RATE_LIMIT_HOURLY`, and `REFRESH_RATE_LIMIT_DAILY` are optional command rate-limit overrides.
 - The bot exports Prometheus metrics on `PROMETHEUS_METRICS_PORT` and the worker exports on `WORKER_PROMETHEUS_METRICS_PORT`.
 
 ## Setup
 
-1. Start PostgreSQL. For local development you can use:
+1. Start infrastructure. For local development:
 
 ```bash
-docker compose up -d db
+docker compose up -d db redis
 ```
 
 2. Apply migrations.
@@ -85,13 +96,19 @@ pip install -r requirements.txt
 python3 worker.py
 ```
 
+To start the optional monitoring stack locally:
+
+```bash
+docker compose up -d prometheus grafana
+```
+
 ## Getting `ALLOWED_CHAT_ID`
 
 1. Start your bot in Telegram and send it a message.
 2. Run:
 
 ```bash
-python3 sripts/get_chat_id.py
+python3 scripts/get_chat_id.py
 ```
 
 3. Copy the printed `chat_id` into `.env`.
@@ -103,6 +120,9 @@ python3 sripts/get_chat_id.py
 - `/nextcycle` - queue an album from the next cycle immediately
 - `/refresh` - queue a provider library sync for the current user
 - `/status` - show DB delivery stats and active provider status
+- `/approve <telegram_user_id>` - admin-only: allow a registered user
+- `/block <telegram_user_id>` - admin-only: block a user
+- `/admin_status` - admin-only: show queue and user summary
 - `/settz` - set the user timezone
 - `/settime` - set the user daily local delivery time
 
@@ -113,15 +133,41 @@ python3 sripts/get_chat_id.py
 - `app.user_library_albums` - per-user normalized album cache
 - `app.user_provider_accounts` / `app.user_provider_sync_state` - provider auth and sync state
 
+## Tests
+
+The repository currently uses `pytest` for the phase-specific suites, and `scripts/run_tests.sh` orchestrates the full local test run.
+
+Run the full local test flow:
+
+```bash
+./scripts/run_tests.sh
+```
+
+That script:
+
+- starts `db` and `redis` with Docker Compose
+- creates a dedicated test database
+- applies Alembic migrations
+- runs the legacy `unittest` suite in `tests/`
+- runs the pytest contract, unit, and integration suites
+- runs `ruff check .`
+
+Run only the current pytest suites:
+
+```bash
+pytest -q tests/test_contract_pytest.py tests/test_unit_pytest.py tests/test_integration_pytest.py
+```
+
 ## Utility Scripts
 
-- `python3 sripts/test_format.py` - check URL/message formatting from cache data
-- `python3 scripts/upsert_provider_credentials.py` - store encrypted provider credentials and optionally queue sync jobs
+- `python3 scripts/get_chat_id.py` - fetch recent Telegram updates and print a likely chat id
+- `python3 scripts/upsert_provider_credentials.py --user-id <id> --provider ytmusic --credentials-file creds.json --enqueue-sync` - store encrypted provider credentials and optionally queue revalidate/sync jobs
+- `python3 scripts/test_format.py` - check album URL/message formatting against a local cache payload
 
 ## Troubleshooting
 
 - Empty library or refresh failures: verify the user has an active provider account with valid credentials, then queue `/refresh`.
-- No daily deliveries: verify the worker is running and the user has valid DB timezone and daily time settings.
+- No daily deliveries: verify the worker is running, Redis is reachable, and the user has valid DB timezone and daily time settings.
 - Jobs stuck in `running`: verify `WORKER_JOB_LEASE_SECONDS` is appropriate for normal job duration and that the worker loop is running.
 - Unauthorized admin actions: verify `ALLOWED_CHAT_ID`.
 
