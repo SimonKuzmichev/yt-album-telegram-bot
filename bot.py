@@ -886,7 +886,7 @@ async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         _log_bot_event("command_now", user_id=user["id"], telegram_chat_id=chat_id)
-        idem_key = f"manual:{user['id']}:{uuid4()}"
+        idem_key = f"manual:{user['id']}:{get_request_id(update)}"
 
         try:
             now_utc = datetime.now(timezone.utc)
@@ -970,7 +970,7 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             status = "rejected"
             return
 
-        idem_key = f"sync:{provider_account['id']}:{uuid4()}"
+        idem_key = f"sync:{provider_account['id']}:{get_request_id(update)}"
         try:
             now_utc = datetime.now(timezone.utc)
             row = enqueue_job_once(
@@ -1110,7 +1110,7 @@ async def cmd_nextcycle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             return
 
         _log_bot_event("command_nextcycle", user_id=user["id"], telegram_chat_id=chat_id)
-        idem_key = f"nextcycle:{user['id']}:{uuid4()}"
+        idem_key = f"nextcycle:{user['id']}:{get_request_id(update)}"
         try:
             now_utc = datetime.now(timezone.utc)
             row = enqueue_job_once(

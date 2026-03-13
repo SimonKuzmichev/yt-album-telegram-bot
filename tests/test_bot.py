@@ -23,6 +23,9 @@ from bot import (  # noqa: E402
     enforce_command_lock,
     enforce_request_dedupe,
     enforce_rate_limit,
+    cmd_nextcycle,
+    cmd_now,
+    cmd_refresh,
     get_command_lock_key,
     get_env_str,
     get_request_dedupe_key,
@@ -226,6 +229,90 @@ class RequestDedupeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(allowed)
         update.message.reply_text.assert_awaited_once()
+
+
+class CommandIdempotencyTests(unittest.IsolatedAsyncioTestCase):
+    def _make_update(self) -> SimpleNamespace:
+        return SimpleNamespace(
+            effective_chat=SimpleNamespace(id=99),
+            effective_message=SimpleNamespace(message_id=7),
+            effective_user=SimpleNamespace(id=42),
+            update_id=101,
+            callback_query=None,
+            message=SimpleNamespace(reply_text=AsyncMock()),
+        )
+
+    def _make_context(self) -> SimpleNamespace:
+        return SimpleNamespace(
+            application=SimpleNamespace(bot_data={}),
+            bot=SimpleNamespace(send_message=AsyncMock()),
+        )
+
+    async def test_cmd_now_uses_request_derived_idempotency_key(self) -> None:
+        update = self._make_update()
+        context = self._make_context()
+        user = {"id": 123}
+        expected_request_id = get_request_id(update)
+
+        with patch("bot.require_allowlisted_user", AsyncMock(return_value=user)), \
+             patch("bot.enforce_request_dedupe", AsyncMock(return_value=True)), \
+             patch("bot.enforce_rate_limit", AsyncMock(return_value=True)), \
+             patch("bot.enforce_command_lock", AsyncMock(return_value=True)), \
+             patch("bot.enqueue_job_once", return_value={"id": "job-1", "attempt": 1}) as enqueue_job_once, \
+             patch("bot.record_command"):
+            await cmd_now(update, context)
+
+        enqueue_job_once.assert_called_once()
+        self.assertEqual(
+            enqueue_job_once.call_args.kwargs["idempotency_key"],
+            f"manual:{user['id']}:{expected_request_id}",
+        )
+
+    async def test_cmd_refresh_uses_request_derived_idempotency_key(self) -> None:
+        update = self._make_update()
+        context = self._make_context()
+        user = {"id": 123}
+        provider_account = {
+            "id": 456,
+            "provider": "ytmusic",
+            "status": "connected",
+        }
+        expected_request_id = get_request_id(update)
+
+        with patch("bot.require_allowlisted_user", AsyncMock(return_value=user)), \
+             patch("bot.enforce_request_dedupe", AsyncMock(return_value=True)), \
+             patch("bot.enforce_rate_limit", AsyncMock(return_value=True)), \
+             patch("bot.enforce_command_lock", AsyncMock(return_value=True)), \
+             patch("bot.get_active_user_provider_account", return_value=provider_account), \
+             patch("bot.enqueue_job_once", return_value={"id": "job-2", "attempt": 1}) as enqueue_job_once, \
+             patch("bot.record_command"):
+            await cmd_refresh(update, context)
+
+        enqueue_job_once.assert_called_once()
+        self.assertEqual(
+            enqueue_job_once.call_args.kwargs["idempotency_key"],
+            f"sync:{provider_account['id']}:{expected_request_id}",
+        )
+
+    async def test_cmd_nextcycle_uses_request_derived_idempotency_key(self) -> None:
+        update = self._make_update()
+        context = self._make_context()
+        user = {"id": 123}
+        expected_request_id = get_request_id(update)
+
+        with patch("bot.require_allowlisted_user", AsyncMock(return_value=user)), \
+             patch("bot.enforce_request_dedupe", AsyncMock(return_value=True)), \
+             patch("bot.enforce_rate_limit", AsyncMock(return_value=True)), \
+             patch("bot.enforce_command_lock", AsyncMock(return_value=True)), \
+             patch("bot.enqueue_job_once", return_value={"id": "job-3", "attempt": 1}) as enqueue_job_once, \
+             patch("bot.record_command"):
+            await cmd_nextcycle(update, context)
+
+        enqueue_job_once.assert_called_once()
+        self.assertEqual(
+            enqueue_job_once.call_args.kwargs["idempotency_key"],
+            f"nextcycle:{user['id']}:{expected_request_id}",
+        )
 
 
 class RateLimitTests(unittest.IsolatedAsyncioTestCase):
