@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 import json
 import tempfile
-from typing import Any, Dict, List, Mapping, Optional, Protocol, TypedDict
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Protocol, TypedDict
 from urllib.parse import quote
 
 
@@ -51,7 +53,6 @@ class YTMusicProviderClient:
     def __init__(self, auth_path: Optional[str] = None, credentials: Optional[Any] = None) -> None:
         self.auth_path = auth_path
         self.credentials = credentials
-        self._materialized_auth_path: Optional[str] = None
 
     def _resolve_auth_value(self) -> Any:
         if self.credentials is None:
@@ -62,31 +63,49 @@ class YTMusicProviderClient:
         if isinstance(self.credentials, str):
             return self.credentials
 
-        if self._materialized_auth_path is None:
-            # ytmusicapi expects a file-like auth input in some setups, so for
-            # DB-backed credential blobs we materialize one private temp file
-            # per worker process and reuse its path for subsequent client builds.
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                suffix=".json",
-                prefix="ytmusic-auth-",
-                delete=False,
-            ) as tmp:
-                json.dump(self.credentials, tmp, ensure_ascii=False)
-                self._materialized_auth_path = tmp.name
-        return self._materialized_auth_path
+        return self._materialize_credentials_file()
 
-    def _create_client(self):
+    def _materialize_credentials_file(self) -> str:
+        fd, tmp_path = tempfile.mkstemp(suffix=".json", prefix="ytmusic-auth-")
+        fd_open = True
+        try:
+            os.chmod(tmp_path, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+                fd_open = False
+                json.dump(self.credentials, tmp, ensure_ascii=False)
+        except Exception:
+            if fd_open:
+                os.close(fd)
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
+            raise
+        return tmp_path
+
+    @contextmanager
+    def _client_session(self) -> Iterator[Any]:
+        auth_value = self._resolve_auth_value()
+        materialized_auth_path = auth_value if self.credentials is not None and not isinstance(self.credentials, str) else None
+
         from ytmusicapi import YTMusic
 
-        return YTMusic(self._resolve_auth_value())
+        try:
+            yield YTMusic(auth_value)
+        finally:
+            if materialized_auth_path:
+                try:
+                    os.unlink(materialized_auth_path)
+                except FileNotFoundError:
+                    pass
 
     def validate_credentials(self) -> None:
-        self._create_client().get_library_albums(limit=1)
+        with self._client_session() as client:
+            client.get_library_albums(limit=1)
 
     def list_saved_albums(self, limit: Optional[int] = None) -> List[NormalizedAlbum]:
-        raw_albums = self._create_client().get_library_albums(limit=limit)
+        with self._client_session() as client:
+            raw_albums = client.get_library_albums(limit=limit)
         albums: List[NormalizedAlbum] = []
         for raw_album in raw_albums:
             normalized = self.normalize_album(raw_album)

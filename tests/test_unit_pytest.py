@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
+import json
+import os
+import stat
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -90,6 +94,62 @@ def test_build_provider_client_normalizes_provider_name() -> None:
     client = build_provider_client("  yTmUsIc  ", credentials={"cookie_blob": "secret"})
 
     assert isinstance(client, YTMusicProviderClient)
+
+
+def test_ytmusic_provider_materialized_credentials_file_is_private_and_removed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    class FakeYTMusic:
+        def __init__(self, auth_value: str) -> None:
+            observed["path"] = auth_value
+            observed["exists_during_init"] = os.path.exists(auth_value)
+            observed["mode"] = stat.S_IMODE(os.stat(auth_value).st_mode)
+            with open(auth_value, encoding="utf-8") as fh:
+                observed["payload"] = json.load(fh)
+
+        def get_library_albums(self, *, limit: int | None = None):
+            assert limit == 5
+            return [{"browseId": "album-1", "title": "Discovery", "artists": [{"name": "Daft Punk"}]}]
+
+    fake_module = ModuleType("ytmusicapi")
+    fake_module.YTMusic = FakeYTMusic
+    monkeypatch.setitem(sys.modules, "ytmusicapi", fake_module)
+
+    client = YTMusicProviderClient(credentials={"cookie_blob": "secret"})
+
+    albums = client.list_saved_albums(limit=5)
+
+    assert [album["provider_album_id"] for album in albums] == ["album-1"]
+    assert observed["exists_during_init"] is True
+    assert observed["mode"] == 0o600
+    assert observed["payload"] == {"cookie_blob": "secret"}
+    assert not os.path.exists(str(observed["path"]))
+
+
+def test_ytmusic_provider_removes_materialized_credentials_file_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    class FakeYTMusic:
+        def __init__(self, auth_value: str) -> None:
+            observed["path"] = auth_value
+
+        def get_library_albums(self, *, limit: int | None = None):
+            raise RuntimeError("boom")
+
+    fake_module = ModuleType("ytmusicapi")
+    fake_module.YTMusic = FakeYTMusic
+    monkeypatch.setitem(sys.modules, "ytmusicapi", fake_module)
+
+    client = YTMusicProviderClient(credentials={"cookie_blob": "secret"})
+
+    with pytest.raises(RuntimeError, match="boom"):
+        client.validate_credentials()
+
+    assert not os.path.exists(str(observed["path"]))
 
 
 def test_sync_provider_account_recovers_needs_reauth_to_connected() -> None:

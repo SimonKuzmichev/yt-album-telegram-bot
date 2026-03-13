@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import Any
 
 import pytest
@@ -88,7 +89,11 @@ def test_provider_adapter_list_saved_albums_filters_invalid_rows(monkeypatch: py
             assert limit == 25
             return raw_albums
 
-    monkeypatch.setattr(client, "_create_client", lambda: FakeYTMusic())
+    @contextmanager
+    def fake_client_session():
+        yield FakeYTMusic()
+
+    monkeypatch.setattr(client, "_client_session", fake_client_session)
 
     albums = client.list_saved_albums(limit=25)
 
