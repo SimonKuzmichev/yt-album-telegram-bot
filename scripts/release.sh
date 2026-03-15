@@ -7,9 +7,8 @@ if ! systemctl is-active --quiet sing-box.service; then
 fi
 
 docker compose build bot-app worker
-docker compose up -d db redis
-docker compose up -d prometheus grafana
-docker compose run --rm --no-deps bot-app alembic upgrade head
+docker compose up -d --wait db redis
+docker compose run --rm -T --no-deps bot-app alembic upgrade head
 docker compose up -d --wait bot-app
 docker compose up -d worker
-docker compose up -d caddy
+docker compose up -d prometheus grafana caddy
