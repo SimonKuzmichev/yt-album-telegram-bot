@@ -118,6 +118,7 @@ def install_module_stubs() -> None:
             "set_user_daily_time",
             "set_user_timezone",
             "update_oauth_session_status",
+            "upsert_user_provider_account_credentials",
             "upsert_user_library_albums",
             "upsert_user",
         ]:

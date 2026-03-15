@@ -148,11 +148,22 @@ class HealthcheckServerTests(unittest.TestCase):
     def test_handle_spotify_callback_consumes_pending_session(self) -> None:
         session = {
             "id": 7,
+            "user_id": 123,
             "status": "pending",
+            "requested_chat_id": 999,
             "expires_at": datetime(2026, 3, 15, 12, 30, tzinfo=timezone.utc),
         }
 
         with patch("bot.get_oauth_session_by_state", return_value=session), \
+             patch("bot.exchange_spotify_code_for_tokens", return_value={
+                 "access_token": "secret-access-token",
+                 "refresh_token": "secret-refresh-token",
+                 "token_type": "Bearer",
+                 "granted_scope": "user-library-read",
+                 "expires_in_seconds": 3600,
+             }), \
+             patch("bot.upsert_user_provider_account_credentials", return_value={"id": 55}) as upsert_account, \
+             patch("bot.enqueue_job_once", return_value={"id": "job-1"}) as enqueue_job_once, \
              patch("bot.update_oauth_session_status", return_value={**session, "status": "consumed"}) as update_status:
             html = handle_spotify_callback(
                 state="state-abc",
@@ -161,6 +172,14 @@ class HealthcheckServerTests(unittest.TestCase):
             )
 
         update_status.assert_called_once_with(7, "consumed", expected_current_status="pending")
+        upsert_account.assert_called_once()
+        self.assertEqual(upsert_account.call_args.kwargs["provider"], "spotify")
+        self.assertEqual(upsert_account.call_args.kwargs["status"], "connected")
+        self.assertEqual(
+            upsert_account.call_args.kwargs["credentials"]["refresh_token"],
+            "secret-refresh-token",
+        )
+        enqueue_job_once.assert_called_once()
         self.assertIn("Spotify authorization received", html)
 
     def test_handle_spotify_callback_marks_expired_session(self) -> None:
@@ -184,20 +203,60 @@ class HealthcheckServerTests(unittest.TestCase):
     def test_handle_spotify_callback_marks_failed_when_code_missing(self) -> None:
         session = {
             "id": 7,
+            "user_id": 123,
             "status": "pending",
             "expires_at": datetime(2026, 3, 15, 12, 30, tzinfo=timezone.utc),
         }
 
         with patch("bot.get_oauth_session_by_state", return_value=session), \
-             patch("bot.update_oauth_session_status", return_value={**session, "status": "failed"}) as update_status:
+             patch("bot._mark_spotify_oauth_failed") as mark_failed:
             html = handle_spotify_callback(
                 state="state-abc",
                 code=None,
                 now_utc=datetime(2026, 3, 15, 12, 0, tzinfo=timezone.utc),
             )
 
-        update_status.assert_called_once_with(7, "failed", expected_current_status="pending")
+        mark_failed.assert_called_once_with(session_id=7, user_id=123)
         self.assertIn("Spotify callback incomplete", html)
+
+    def test_handle_spotify_callback_returns_already_processed_for_consumed_session(self) -> None:
+        session = {
+            "id": 7,
+            "user_id": 123,
+            "status": "consumed",
+            "expires_at": datetime(2026, 3, 15, 12, 30, tzinfo=timezone.utc),
+        }
+
+        with patch("bot.get_oauth_session_by_state", return_value=session), \
+             patch("bot.exchange_spotify_code_for_tokens") as exchange_tokens:
+            html = handle_spotify_callback(
+                state="state-abc",
+                code="code-123",
+                now_utc=datetime(2026, 3, 15, 12, 0, tzinfo=timezone.utc),
+            )
+
+        exchange_tokens.assert_not_called()
+        self.assertIn("Spotify callback already processed", html)
+
+    def test_handle_spotify_callback_marks_failed_when_token_exchange_fails(self) -> None:
+        session = {
+            "id": 7,
+            "user_id": 123,
+            "status": "pending",
+            "expires_at": datetime(2026, 3, 15, 12, 30, tzinfo=timezone.utc),
+        }
+
+        with patch("bot.get_oauth_session_by_state", return_value=session), \
+             patch("bot.exchange_spotify_code_for_tokens", side_effect=RuntimeError("boom")), \
+             patch("bot._mark_spotify_oauth_failed") as mark_failed:
+            html = handle_spotify_callback(
+                state="state-abc",
+                code="code-123",
+                now_utc=datetime(2026, 3, 15, 12, 0, tzinfo=timezone.utc),
+            )
+
+        mark_failed.assert_called_once_with(session_id=7, user_id=123)
+        self.assertIn("Spotify connection failed", html)
 
 
 class RateLimitHelperTests(unittest.TestCase):

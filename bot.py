@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, PlainTextResponse
+import requests
 try:
     import redis.asyncio as redis
 except ModuleNotFoundError:  # pragma: no cover - exercised only when dependency is absent
@@ -49,10 +50,12 @@ from src.db import (
     get_user_settings,
     list_user_provider_accounts,
     list_recent_deliveries,
+    mark_user_provider_account_status,
     set_active_user_provider_account,
     set_user_daily_time,
     set_user_timezone,
     update_oauth_session_status,
+    upsert_user_provider_account_credentials,
     upsert_user,
 )
 from src.telegram_delivery import (
@@ -89,6 +92,7 @@ RATE_LIMIT_WINDOWS = {
 logger = logging.getLogger(__name__)
 DEFAULT_SPOTIFY_SCOPE = "user-library-read"
 DEFAULT_OAUTH_STATE_TTL_SECONDS = 600
+SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 
 
 class HTTPServerHandle:
@@ -185,6 +189,113 @@ def build_spotify_authorize_url(*, client_id: str, redirect_uri: str, state: str
     return f"https://accounts.spotify.com/authorize?{query}"
 
 
+def _get_spotify_token_exchange_credentials() -> tuple[str, str, str]:
+    client_id = os.getenv("SPOTIFY_CLIENT_ID", "").strip()
+    client_secret = os.getenv("SPOTIFY_CLIENT_SECRET", "").strip()
+    redirect_uri = os.getenv("SPOTIFY_REDIRECT_URI", "").strip()
+    if not client_id or not client_secret or not redirect_uri:
+        raise RuntimeError(
+            "Spotify OAuth is not configured. Set SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, and SPOTIFY_REDIRECT_URI."
+        )
+    return client_id, client_secret, redirect_uri
+
+
+def exchange_spotify_code_for_tokens(*, code: str) -> Dict[str, Any]:
+    client_id, client_secret, redirect_uri = _get_spotify_token_exchange_credentials()
+    response = requests.post(
+        SPOTIFY_TOKEN_URL,
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": redirect_uri,
+        },
+        auth=(client_id, client_secret),
+        timeout=15,
+    )
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError(f"Spotify token exchange returned invalid JSON (status={response.status_code})") from exc
+
+    if response.status_code >= 400:
+        error_code = payload.get("error") or "unknown_error"
+        error_description = payload.get("error_description") or "token exchange failed"
+        raise RuntimeError(f"Spotify token exchange failed: {error_code}: {error_description}")
+
+    access_token = str(payload.get("access_token") or "").strip()
+    token_type = str(payload.get("token_type") or "").strip()
+    expires_in = payload.get("expires_in")
+    if not access_token or not token_type or expires_in is None:
+        raise RuntimeError("Spotify token exchange response was missing required fields")
+
+    try:
+        expires_in_seconds = int(expires_in)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Spotify token exchange returned an invalid expires_in value") from exc
+
+    refresh_token = str(payload.get("refresh_token") or "").strip()
+    granted_scope = str(payload.get("scope") or "").strip()
+
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": token_type,
+        "granted_scope": granted_scope,
+        "expires_in_seconds": expires_in_seconds,
+    }
+
+
+def _ensure_spotify_failure_account_state(user_id: int) -> None:
+    accounts = list_user_provider_accounts(user_id)
+    spotify_account = next((row for row in accounts if str(row.get("provider") or "") == "spotify"), None)
+    if spotify_account is not None:
+        mark_user_provider_account_status(int(spotify_account["id"]), "needs_reauth")
+        return
+
+    upsert_user_provider_account_credentials(
+        user_id=user_id,
+        provider="spotify",
+        credentials={},
+        status="pending",
+        is_active=False,
+    )
+
+
+def _mark_spotify_oauth_failed(*, session_id: int, user_id: int) -> None:
+    try:
+        update_oauth_session_status(
+            session_id,
+            OAUTH_SESSION_STATUS_FAILED,
+            expected_current_status=OAUTH_SESSION_STATUS_PENDING,
+        )
+        _ensure_spotify_failure_account_state(user_id)
+    except Exception:
+        logger.exception("Failed to persist Spotify OAuth failure state session_id=%s user_id=%s", session_id, user_id)
+
+
+def _queue_spotify_initial_sync(*, user_id: int, provider_account_id: int, telegram_chat_id: Optional[int]) -> None:
+    if telegram_chat_id is None:
+        return
+
+    now_utc = datetime.now(timezone.utc)
+    idempotency_key = f"spotify-oauth-sync:{provider_account_id}"
+    enqueue_job_once(
+        idempotency_key=idempotency_key,
+        idempotency_expires_at=now_utc + timedelta(minutes=30),
+        job_id=uuid4(),
+        user_id=user_id,
+        job_type=JOB_TYPE_SYNC_LIBRARY,
+        run_at=now_utc,
+        payload={
+            "telegram_chat_id": telegram_chat_id,
+            "idempotency_key": idempotency_key,
+            "user_provider_account_id": provider_account_id,
+            "provider": "spotify",
+        },
+    )
+
+
 def handle_spotify_callback(
     *,
     state: str | None,
@@ -225,8 +336,8 @@ def handle_spotify_callback(
 
     if str(session.get("status") or "") != OAUTH_SESSION_STATUS_PENDING:
         return build_spotify_callback_html(
-            title="Spotify state already used",
-            message="This connection request is no longer active.",
+            title="Spotify callback already processed",
+            message="This connection request was already handled. You can return to Telegram.",
             state_present=True,
             code_present=code_present,
         )
@@ -246,11 +357,7 @@ def handle_spotify_callback(
         )
 
     if _query_param_present(error):
-        update_oauth_session_status(
-            int(session["id"]),
-            OAUTH_SESSION_STATUS_FAILED,
-            expected_current_status=OAUTH_SESSION_STATUS_PENDING,
-        )
+        _mark_spotify_oauth_failed(session_id=int(session["id"]), user_id=int(session["user_id"]))
         return build_spotify_callback_html(
             title="Spotify authorization failed",
             message="Spotify returned an authorization error. Start /connect_spotify again in Telegram.",
@@ -259,16 +366,49 @@ def handle_spotify_callback(
         )
 
     if not code_present:
-        update_oauth_session_status(
-            int(session["id"]),
-            OAUTH_SESSION_STATUS_FAILED,
-            expected_current_status=OAUTH_SESSION_STATUS_PENDING,
-        )
+        _mark_spotify_oauth_failed(session_id=int(session["id"]), user_id=int(session["user_id"]))
         return build_spotify_callback_html(
             title="Spotify callback incomplete",
             message="Missing authorization code. Start /connect_spotify again in Telegram.",
             state_present=True,
             code_present=False,
+        )
+
+    try:
+        token_payload = exchange_spotify_code_for_tokens(code=str(code))
+    except Exception:
+        logger.exception("Spotify token exchange failed for oauth_session_id=%s", session.get("id"))
+        _mark_spotify_oauth_failed(session_id=int(session["id"]), user_id=int(session["user_id"]))
+        return build_spotify_callback_html(
+            title="Spotify connection failed",
+            message="Spotify returned, but token exchange failed. Start /connect_spotify again in Telegram.",
+            state_present=True,
+            code_present=True,
+        )
+
+    try:
+        token_expires_at = current_time + timedelta(seconds=int(token_payload["expires_in_seconds"]))
+        provider_account = upsert_user_provider_account_credentials(
+            user_id=int(session["user_id"]),
+            provider="spotify",
+            credentials={
+                "access_token": token_payload["access_token"],
+                "refresh_token": token_payload["refresh_token"],
+                "token_type": token_payload["token_type"],
+                "granted_scope": token_payload["granted_scope"],
+            },
+            status=PROVIDER_ACCOUNT_STATUS_CONNECTED,
+            is_active=True,
+            token_expires_at=token_expires_at,
+        )
+    except Exception:
+        logger.exception("Failed to persist Spotify credentials for oauth_session_id=%s", session.get("id"))
+        _mark_spotify_oauth_failed(session_id=int(session["id"]), user_id=int(session["user_id"]))
+        return build_spotify_callback_html(
+            title="Spotify connection failed",
+            message="Spotify returned successfully, but we could not finish saving the connection. Start /connect_spotify again in Telegram.",
+            state_present=True,
+            code_present=True,
         )
 
     updated_session = update_oauth_session_status(
@@ -278,11 +418,17 @@ def handle_spotify_callback(
     )
     if updated_session is None:
         return build_spotify_callback_html(
-            title="Spotify state already used",
-            message="This connection request is no longer active.",
+            title="Spotify callback already processed",
+            message="This connection request was already handled. You can return to Telegram.",
             state_present=True,
             code_present=True,
         )
+
+    _queue_spotify_initial_sync(
+        user_id=int(session["user_id"]),
+        provider_account_id=int(provider_account["id"]),
+        telegram_chat_id=session.get("requested_chat_id"),
+    )
 
     return build_spotify_callback_html(
         title="Spotify authorization received",
