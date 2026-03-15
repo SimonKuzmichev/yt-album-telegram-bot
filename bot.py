@@ -2,12 +2,13 @@ import logging
 import os
 import threading
 from datetime import datetime, time as dt_time, timedelta, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from uuid import NAMESPACE_URL, uuid4, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Any, Dict, Optional
 
 from dotenv import load_dotenv
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse, PlainTextResponse
 try:
     import redis.asyncio as redis
 except ModuleNotFoundError:  # pragma: no cover - exercised only when dependency is absent
@@ -20,6 +21,7 @@ from telegram.ext import (
     ContextTypes,
     Defaults,
 )
+import uvicorn
 
 from src.errors import is_auth_error, format_auth_help
 from src.logging_utils import configure_logging, log_event
@@ -77,42 +79,65 @@ RATE_LIMIT_WINDOWS = {
 logger = logging.getLogger(__name__)
 
 
-class HealthcheckHTTPServer(ThreadingHTTPServer):
-    daemon_threads = True
-    allow_reuse_address = True
+class HTTPServerHandle:
+    def __init__(self, server: uvicorn.Server, thread: threading.Thread) -> None:
+        self.server = server
+        self.thread = thread
+
+    def shutdown(self) -> None:
+        self.server.should_exit = True
+        self.thread.join(timeout=5)
 
 
-class HealthcheckRequestHandler(BaseHTTPRequestHandler):
-    server_version = "DailyYTAlbumBotHTTP/1.0"
+def create_http_app() -> FastAPI:
+    app = FastAPI()
 
-    def do_GET(self) -> None:  # noqa: N802 - stdlib naming convention
-        status_code, body = get_http_response(self.path)
-        if status_code == 200:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
+    @app.get("/healthz", response_class=PlainTextResponse)
+    async def healthz() -> str:
+        return "ok"
 
-        self.send_error(status_code)
+    @app.get("/oauth/spotify/callback", response_class=HTMLResponse)
+    async def spotify_callback(state: str | None = None, code: str | None = None) -> str:
+        return build_spotify_callback_html(
+            state_present=_query_param_present(state),
+            code_present=_query_param_present(code),
+        )
 
-    def log_message(self, format: str, *args: Any) -> None:
-        # Keep health checks out of stdout/stderr unless we explicitly log them.
-        return
+    return app
 
 
-def start_http_server(host: str, port: int) -> HealthcheckHTTPServer:
-    http_server = HealthcheckHTTPServer((host, port), HealthcheckRequestHandler)
-    thread = threading.Thread(target=http_server.serve_forever, name="healthcheck-http", daemon=True)
+def start_http_server(host: str, port: int) -> HTTPServerHandle:
+    config = uvicorn.Config(
+        create_http_app(),
+        host=host,
+        port=port,
+        log_level="warning",
+        access_log=False,
+    )
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, name="healthcheck-http", daemon=True)
     thread.start()
-    return http_server
+    return HTTPServerHandle(server, thread)
 
 
-def get_http_response(path: str) -> tuple[int, bytes]:
-    if path == "/healthz":
-        return 200, b"ok\n"
-    return 404, b""
+def build_spotify_callback_html(*, state_present: bool, code_present: bool) -> str:
+    state_value = "yes" if state_present else "no"
+    code_value = "yes" if code_present else "no"
+    return (
+        "<!doctype html>"
+        "<html lang=\"en\">"
+        "<head><meta charset=\"utf-8\"><title>Spotify Callback</title></head>"
+        "<body>"
+        "<h1>Spotify callback reached</h1>"
+        f"<p>state present: {state_value}</p>"
+        f"<p>code present: {code_value}</p>"
+        "</body>"
+        "</html>\n"
+    )
+
+
+def _query_param_present(value: str | None) -> bool:
+    return value is not None and value != ""
 
 
 def _log_bot_event(
@@ -1407,7 +1432,6 @@ def main() -> None:
         app.run_polling(allowed_updates=Update.ALL_TYPES)
     finally:
         http_server.shutdown()
-        http_server.server_close()
 
 
 if __name__ == "__main__":

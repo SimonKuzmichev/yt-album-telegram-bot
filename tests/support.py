@@ -8,6 +8,25 @@ def install_module_stubs() -> None:
         dotenv.load_dotenv = lambda: None
         sys.modules["dotenv"] = dotenv
 
+    if "fastapi" not in sys.modules:
+        fastapi = ModuleType("fastapi")
+
+        class _FastAPI:
+            def get(self, *_args, **_kwargs):
+                def decorator(func):
+                    return func
+
+                return decorator
+
+        fastapi.FastAPI = _FastAPI
+        sys.modules["fastapi"] = fastapi
+
+    if "fastapi.responses" not in sys.modules:
+        fastapi_responses = ModuleType("fastapi.responses")
+        fastapi_responses.HTMLResponse = type("HTMLResponse", (), {})
+        fastapi_responses.PlainTextResponse = type("PlainTextResponse", (), {})
+        sys.modules["fastapi.responses"] = fastapi_responses
+
     if "telegram" not in sys.modules:
         telegram = ModuleType("telegram")
         telegram.Update = type("Update", (), {"ALL_TYPES": object()})
@@ -106,3 +125,23 @@ def install_module_stubs() -> None:
         telegram_delivery.build_keyboard = lambda *args, **kwargs: None
         telegram_delivery.send_album_message = lambda *args, **kwargs: None
         sys.modules["src.telegram_delivery"] = telegram_delivery
+
+    if "uvicorn" not in sys.modules:
+        uvicorn = ModuleType("uvicorn")
+
+        class _Config:
+            def __init__(self, *args, **kwargs):
+                self.args = args
+                self.kwargs = kwargs
+
+        class _Server:
+            def __init__(self, config):
+                self.config = config
+                self.should_exit = False
+
+            def run(self):
+                return None
+
+        uvicorn.Config = _Config
+        uvicorn.Server = _Server
+        sys.modules["uvicorn"] = uvicorn

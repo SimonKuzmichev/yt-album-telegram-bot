@@ -66,7 +66,7 @@ Notes:
 - `/refresh` now queues a sync for the calling user’s active provider account.
 - `DAILY_TIME` is no longer used.
 - `bot.py` resolves its app timezone from the admin override user's DB settings when that user exists; otherwise it falls back to `DEFAULT_TIMEZONE`.
-- `bot.py` also exposes a tiny HTTP server on `HTTP_HOST:HTTP_PORT` for reverse-proxy health checks. By default it listens on `0.0.0.0:8080` and serves `GET /healthz`.
+- `bot.py` also exposes a tiny HTTP server on `HTTP_HOST:HTTP_PORT` for reverse-proxy health checks and OAuth handoff. By default it listens on `0.0.0.0:8080` and serves `GET /healthz` plus `GET /oauth/spotify/callback`.
 - Compose now runs Caddy as the public reverse proxy. `bot-app` stays on the internal Compose network via `expose`, while Caddy publishes ports `80` and `443` and keeps certificates in named volumes.
 - `WORKER_JOB_LEASE_SECONDS` controls when `running` jobs are considered stale and requeued after a worker crash.
 - `PROVIDER_SYNC_INTERVAL_SECONDS` controls periodic background provider sync scheduling.

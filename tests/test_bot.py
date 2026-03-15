@@ -17,8 +17,10 @@ from bot import (  # noqa: E402
     _is_admin_override_chat,
     _format_retry_after,
     _get_rate_limit_bucket,
+    _query_param_present,
     acquire_command_lock,
     acquire_request_dedupe,
+    build_spotify_callback_html,
     check_rate_limit,
     enforce_command_lock,
     enforce_request_dedupe,
@@ -28,7 +30,6 @@ from bot import (  # noqa: E402
     cmd_refresh,
     get_command_lock_key,
     get_env_str,
-    get_http_response,
     get_request_dedupe_key,
     get_rate_limit_key,
     get_optional_env_int,
@@ -83,17 +84,25 @@ class GetEnvStrTests(unittest.TestCase):
 
 
 class HealthcheckServerTests(unittest.TestCase):
-    def test_healthz_returns_ok(self) -> None:
-        status_code, body = get_http_response("/healthz")
+    def test_spotify_callback_echoes_presence_without_secret_values(self) -> None:
+        html = build_spotify_callback_html(state_present=True, code_present=True)
 
-        self.assertEqual(status_code, 200)
-        self.assertEqual(body, b"ok\n")
+        self.assertIn("Spotify callback reached", html)
+        self.assertIn("state present: yes", html)
+        self.assertIn("code present: yes", html)
+        self.assertNotIn("abc123", html)
+        self.assertNotIn("secret-code", html)
 
-    def test_unknown_path_returns_not_found(self) -> None:
-        status_code, body = get_http_response("/oauth/spotify/callback")
+    def test_spotify_callback_reports_missing_values(self) -> None:
+        html = build_spotify_callback_html(state_present=False, code_present=False)
 
-        self.assertEqual(status_code, 404)
-        self.assertEqual(body, b"")
+        self.assertIn("state present: no", html)
+        self.assertIn("code present: no", html)
+
+    def test_query_param_presence_rejects_blank_and_missing_values(self) -> None:
+        self.assertTrue(_query_param_present("abc123"))
+        self.assertFalse(_query_param_present(""))
+        self.assertFalse(_query_param_present(None))
 
 
 class RateLimitHelperTests(unittest.TestCase):
