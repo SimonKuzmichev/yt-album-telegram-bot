@@ -18,8 +18,10 @@ ProviderAccountRow = Dict[str, Any]
 OAuthSessionRow = Dict[str, Any]
 logger = logging.getLogger(__name__)
 
-PROVIDER_ACCOUNT_STATUS_PENDING = "pending"
+PROVIDER_ACCOUNT_STATUS_NOT_CONNECTED = "not_connected"
+PROVIDER_ACCOUNT_STATUS_PENDING = "pending_oauth"
 PROVIDER_ACCOUNT_STATUS_CONNECTED = "connected"
+PROVIDER_ACCOUNT_STATUS_TOKEN_EXPIRED = "token_expired"
 PROVIDER_ACCOUNT_STATUS_NEEDS_REAUTH = "needs_reauth"
 PROVIDER_ACCOUNT_STATUS_DISABLED = "disabled"
 
@@ -1650,6 +1652,43 @@ def mark_user_provider_account_status(account_id: int, status: str) -> Optional[
         return row
     except Exception:
         logger.exception("DB mark_user_provider_account_status failed account_id=%s status=%s", account_id, status)
+        raise
+
+
+def disable_user_provider_account(account_id: int) -> Optional[ProviderAccountRow]:
+    logger.debug("DB disable_user_provider_account started account_id=%s", account_id)
+    try:
+        with open_db_connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE app.user_provider_accounts
+                        SET
+                            status = %s,
+                            is_active = FALSE,
+                            updated_at = NOW()
+                        WHERE id = %s
+                        RETURNING
+                            id,
+                            user_id,
+                            provider,
+                            status,
+                            is_active,
+                            token_expires_at,
+                            granted_scope,
+                            last_auth_at,
+                            last_refresh_at,
+                            created_at,
+                            updated_at
+                        """,
+                        (PROVIDER_ACCOUNT_STATUS_DISABLED, account_id),
+                    )
+                    row = cur.fetchone()
+        logger.debug("DB disable_user_provider_account done account_id=%s found=%s", account_id, row is not None)
+        return row
+    except Exception:
+        logger.exception("DB disable_user_provider_account failed account_id=%s", account_id)
         raise
 
 

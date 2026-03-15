@@ -77,7 +77,11 @@ def install_module_stubs() -> None:
         db.OAUTH_SESSION_STATUS_FAILED = "failed"
         db.OAUTH_SESSION_STATUS_PENDING = "pending"
         db.PROVIDER_ACCOUNT_STATUS_CONNECTED = "connected"
+        db.PROVIDER_ACCOUNT_STATUS_DISABLED = "disabled"
+        db.PROVIDER_ACCOUNT_STATUS_NOT_CONNECTED = "not_connected"
         db.PROVIDER_ACCOUNT_STATUS_NEEDS_REAUTH = "needs_reauth"
+        db.PROVIDER_ACCOUNT_STATUS_PENDING = "pending_oauth"
+        db.PROVIDER_ACCOUNT_STATUS_TOKEN_EXPIRED = "token_expired"
         db.SYNC_RESULT_AUTH_ERROR = "auth_error"
         db.SYNC_RESULT_EMPTY_LIBRARY = "empty_library"
         db.SYNC_RESULT_OK = "ok"
@@ -87,6 +91,7 @@ def install_module_stubs() -> None:
             "block_user",
             "claim_runnable_jobs",
             "create_oauth_session",
+            "disable_user_provider_account",
             "enqueue_job_once",
             "ensure_user_settings",
             "get_active_user_provider_account",

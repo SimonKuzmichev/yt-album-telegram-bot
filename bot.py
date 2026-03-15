@@ -36,9 +36,15 @@ from src.db import (
     OAUTH_SESSION_STATUS_FAILED,
     OAUTH_SESSION_STATUS_PENDING,
     PROVIDER_ACCOUNT_STATUS_CONNECTED,
+    PROVIDER_ACCOUNT_STATUS_DISABLED,
+    PROVIDER_ACCOUNT_STATUS_NOT_CONNECTED,
+    PROVIDER_ACCOUNT_STATUS_NEEDS_REAUTH,
+    PROVIDER_ACCOUNT_STATUS_PENDING,
+    PROVIDER_ACCOUNT_STATUS_TOKEN_EXPIRED,
     approve_user,
     block_user,
     create_oauth_session,
+    disable_user_provider_account,
     enqueue_job_once,
     ensure_user_settings,
     get_active_user_provider_account,
@@ -70,6 +76,19 @@ Album = Dict[str, Any]
 JOB_TYPE_DELIVER_NOW = "deliver_now"
 JOB_TYPE_NEXT_CYCLE_NOW = "next_cycle_now"
 JOB_TYPE_SYNC_LIBRARY = "sync_library"
+HELP_LINES = [
+    "/help - show available commands",
+    "/status - show account, sync, and token state",
+    "/connect_spotify - start a new Spotify connection",
+    "/reconnect_spotify - restart Spotify OAuth for your account",
+    "/disconnect_spotify - disable the Spotify account",
+    "/refresh - queue a library sync for the active provider",
+    "/now - queue an immediate album delivery",
+    "/nextcycle - force the next cycle album",
+    "/provider <provider_name> - switch the active provider",
+    "/settz <IANA_TZ> - set your timezone",
+    "/settime <HH:MM> - set your daily delivery time",
+]
 COMMAND_LOCK_TTLS_SECONDS = {
     "refresh": 60,
     "now": 5,
@@ -257,7 +276,7 @@ def _ensure_spotify_failure_account_state(user_id: int) -> None:
         user_id=user_id,
         provider="spotify",
         credentials={},
-        status="pending",
+        status=PROVIDER_ACCOUNT_STATUS_PENDING,
         is_active=False,
     )
 
@@ -300,6 +319,111 @@ def _queue_spotify_initial_sync(*, user_id: int, provider_account_id: int, teleg
             "provider": "spotify",
         },
     )
+
+
+def _find_provider_account(accounts: list[dict[str, Any]], provider: str) -> Optional[dict[str, Any]]:
+    normalized_provider = provider.strip().lower()
+    for account in accounts:
+        if str(account.get("provider") or "").strip().lower() == normalized_provider:
+            return account
+    return None
+
+
+def _derive_provider_status(account: Optional[dict[str, Any]]) -> str:
+    if account is None:
+        return PROVIDER_ACCOUNT_STATUS_NOT_CONNECTED
+    raw_status = str(account.get("status") or "").strip().lower()
+    if raw_status == PROVIDER_ACCOUNT_STATUS_CONNECTED:
+        expires_at = account.get("token_expires_at")
+        if isinstance(expires_at, datetime):
+            normalized_expiry = expires_at if expires_at.tzinfo is not None else expires_at.replace(tzinfo=timezone.utc)
+            if normalized_expiry <= datetime.now(timezone.utc):
+                return PROVIDER_ACCOUNT_STATUS_TOKEN_EXPIRED
+    return raw_status or PROVIDER_ACCOUNT_STATUS_NOT_CONNECTED
+
+
+def _needs_provider_reauth(derived_status: str) -> bool:
+    return derived_status in {PROVIDER_ACCOUNT_STATUS_TOKEN_EXPIRED, PROVIDER_ACCOUNT_STATUS_NEEDS_REAUTH}
+
+
+async def _start_spotify_oauth(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    user: dict[str, Any],
+    command_name: str,
+) -> str:
+    chat_id = get_update_chat_id(update)
+    if chat_id is None:
+        return "rejected"
+
+    client_id = os.getenv("SPOTIFY_CLIENT_ID", "").strip()
+    redirect_uri = os.getenv("SPOTIFY_REDIRECT_URI", "").strip()
+    if not client_id or not redirect_uri:
+        await reply(
+            update,
+            context,
+            "Spotify OAuth is not configured yet. Set SPOTIFY_CLIENT_ID and SPOTIFY_REDIRECT_URI.",
+        )
+        return "rejected"
+
+    try:
+        accounts = list_user_provider_accounts(int(user["id"]))
+    except Exception as e:
+        await notify_error(context, chat_id, "Failed to load Spotify account state", e)
+        return "error"
+
+    spotify_account = _find_provider_account(accounts, "spotify")
+    if spotify_account is not None and command_name == "connect_spotify":
+        current_status = _derive_provider_status(spotify_account)
+        if current_status == PROVIDER_ACCOUNT_STATUS_CONNECTED:
+            await reply(
+                update,
+                context,
+                "Spotify is already connected. Use /reconnect_spotify if you want to replace the connection.",
+            )
+            return "rejected"
+
+    state = generate_oauth_state()
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=get_spotify_oauth_state_ttl_seconds())
+    try:
+        create_oauth_session(
+            user_id=int(user["id"]),
+            provider="spotify",
+            state=state,
+            requested_chat_id=chat_id,
+            expires_at=expires_at,
+        )
+        if spotify_account is None:
+            upsert_user_provider_account_credentials(
+                user_id=int(user["id"]),
+                provider="spotify",
+                credentials={},
+                status=PROVIDER_ACCOUNT_STATUS_PENDING,
+                is_active=False,
+            )
+        else:
+            mark_user_provider_account_status(int(spotify_account["id"]), PROVIDER_ACCOUNT_STATUS_PENDING)
+    except Exception as e:
+        await notify_error(context, chat_id, "Failed to start Spotify OAuth", e)
+        return "error"
+
+    authorize_url = build_spotify_authorize_url(
+        client_id=client_id,
+        redirect_uri=redirect_uri,
+        state=state,
+    )
+    verb = "Reconnect" if command_name == "reconnect_spotify" else "Connect"
+    await reply(
+        update,
+        context,
+        (
+            f"{verb} Spotify with this link:\n"
+            f"{authorize_url}\n\n"
+            "This link is single-use and expires soon."
+        ),
+    )
+    return "success"
 
 
 def handle_spotify_callback(
@@ -982,7 +1106,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await reply(
             update,
             context,
-            "Welcome, you're active. Use /settime and /settz.",
+            "Welcome, you're active. Use /help to see available commands.",
             reply_markup=build_keyboard(None),
         )
         status = "success"
@@ -1469,54 +1593,73 @@ async def cmd_connect_spotify(update: Update, context: ContextTypes.DEFAULT_TYPE
         if user is None:
             status = "rejected"
             return
+        status = await _start_spotify_oauth(update, context, user=user, command_name="connect_spotify")
+    finally:
+        record_command("connect_spotify", status)
+
+
+async def cmd_reconnect_spotify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    status = "error"
+    try:
+        user = await require_allowlisted_user(update, context, "reconnect_spotify")
+        if user is None:
+            status = "rejected"
+            return
+        status = await _start_spotify_oauth(update, context, user=user, command_name="reconnect_spotify")
+    finally:
+        record_command("reconnect_spotify", status)
+
+
+async def cmd_disconnect_spotify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    status = "error"
+    try:
+        user = await require_allowlisted_user(update, context, "disconnect_spotify")
+        if user is None:
+            status = "rejected"
+            return
         chat_id = get_update_chat_id(update)
         if chat_id is None:
             status = "rejected"
             return
 
-        client_id = os.getenv("SPOTIFY_CLIENT_ID", "").strip()
-        redirect_uri = os.getenv("SPOTIFY_REDIRECT_URI", "").strip()
-        if not client_id or not redirect_uri:
-            await reply(
-                update,
-                context,
-                "Spotify OAuth is not configured yet. Set SPOTIFY_CLIENT_ID and SPOTIFY_REDIRECT_URI.",
-            )
-            status = "rejected"
-            return
-
-        state = generate_oauth_state()
-        expires_at = datetime.now(timezone.utc) + timedelta(seconds=get_spotify_oauth_state_ttl_seconds())
         try:
-            create_oauth_session(
-                user_id=int(user["id"]),
-                provider="spotify",
-                state=state,
-                requested_chat_id=chat_id,
-                expires_at=expires_at,
-            )
+            accounts = list_user_provider_accounts(int(user["id"]))
+            spotify_account = _find_provider_account(accounts, "spotify")
         except Exception as e:
-            await notify_error(context, chat_id, "Failed to start Spotify OAuth", e)
+            await notify_error(context, chat_id, "Failed to load Spotify account", e)
             status = "error"
             return
 
-        authorize_url = build_spotify_authorize_url(
-            client_id=client_id,
-            redirect_uri=redirect_uri,
-            state=state,
-        )
-        await reply(
-            update,
-            context,
-            (
-                "Open this link to connect Spotify:\n"
-                f"{authorize_url}\n\n"
-                "This link is single-use and expires soon."
-            ),
-        )
+        if spotify_account is None:
+            await reply(update, context, "Spotify is not connected for your account.")
+            status = "rejected"
+            return
+
+        try:
+            disabled_account = disable_user_provider_account(int(spotify_account["id"]))
+        except Exception as e:
+            await notify_error(context, chat_id, "Failed to disconnect Spotify", e)
+            status = "error"
+            return
+
+        if disabled_account is None:
+            await reply(update, context, "Spotify account was not found.")
+            status = "rejected"
+            return
+
+        await reply(update, context, "Spotify disconnected. Use /connect_spotify or /reconnect_spotify when ready.")
         status = "success"
     finally:
-        record_command("connect_spotify", status)
+        record_command("disconnect_spotify", status)
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    status = "error"
+    try:
+        await reply(update, context, "Available commands:\n" + "\n".join(HELP_LINES), reply_markup=build_keyboard(None))
+        status = "success"
+    finally:
+        record_command("help", status)
 
 
 async def cmd_nextcycle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1639,10 +1782,14 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             settings = get_user_settings(user["id"])
             db_stats = get_user_delivery_stats(user["id"])
             recent_deliveries = list_recent_deliveries(user["id"], limit=5)
+            all_provider_accounts = list_user_provider_accounts(user["id"])
         except Exception as e:
             await notify_error(context, chat_id, "Failed to load DB status", e)
             status = "error"
             return
+
+        if provider_account is None:
+            provider_account = _find_provider_account(all_provider_accounts, "spotify")
 
         sync_state = None
         if provider_account is not None:
@@ -1660,15 +1807,23 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             telegram_chat_id=chat_id,
         )
 
+        derived_provider_status = _derive_provider_status(provider_account)
+        token_expiry_state = "n/a"
+        if provider_account is not None:
+            token_expiry_state = "expired" if derived_provider_status == PROVIDER_ACCOUNT_STATUS_TOKEN_EXPIRED else "ok"
+        reauth_needed = "yes" if _needs_provider_reauth(derived_provider_status) else "no"
+
         msg_lines = [
             "DB user:",
             f"Access: allowlisted={user.get('allowlisted')} status={user.get('status')}",
             f"Timezone: {settings.get('timezone')}",
             f"Daily time: {settings.get('daily_time_local')}",
-            f"Active provider: {(provider_account or {}).get('provider') or 'n/a'}",
-            f"Provider status: {(provider_account or {}).get('status') or 'n/a'}",
+            f"Provider: {(provider_account or {}).get('provider') or 'spotify'}",
+            f"Provider status: {derived_provider_status}",
             f"Granted scope: {(provider_account or {}).get('granted_scope') or 'n/a'}",
             f"Token expires: {_fmt_ts((provider_account or {}).get('token_expires_at'), tz)}",
+            f"Token expiry state: {token_expiry_state}",
+            f"Reauth needed: {reauth_needed}",
             f"Last auth: {_fmt_ts((provider_account or {}).get('last_auth_at'), tz)}",
             f"Last token refresh: {_fmt_ts((provider_account or {}).get('last_refresh_at'), tz)}",
             f"Last sync result: {(sync_state or {}).get('last_sync_result') or 'n/a'}",
@@ -1786,8 +1941,11 @@ def main() -> None:
     app.add_handler(CommandHandler("settz", cmd_settz))
     app.add_handler(CommandHandler("settime", cmd_settime))
     app.add_handler(CommandHandler("provider", cmd_provider))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("connect_ytmusic", cmd_connect_ytmusic))
     app.add_handler(CommandHandler("connect_spotify", cmd_connect_spotify))
+    app.add_handler(CommandHandler("reconnect_spotify", cmd_reconnect_spotify))
+    app.add_handler(CommandHandler("disconnect_spotify", cmd_disconnect_spotify))
     app.add_handler(CommandHandler("now", cmd_now))
     app.add_handler(CommandHandler("nextcycle", cmd_nextcycle))
     app.add_handler(CommandHandler("refresh", cmd_refresh))

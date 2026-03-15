@@ -25,6 +25,9 @@ from bot import (  # noqa: E402
     build_spotify_callback_html,
     check_rate_limit,
     cmd_connect_spotify,
+    cmd_disconnect_spotify,
+    cmd_help,
+    cmd_reconnect_spotify,
     cmd_status,
     enforce_command_lock,
     enforce_request_dedupe,
@@ -519,12 +522,15 @@ class ConnectSpotifyTests(unittest.IsolatedAsyncioTestCase):
             clear=False,
         ), \
              patch("bot.require_allowlisted_user", AsyncMock(return_value=user)), \
+             patch("bot.list_user_provider_accounts", return_value=[]), \
              patch("bot.generate_oauth_state", return_value="state-abc"), \
              patch("bot.create_oauth_session", return_value={"id": 1}) as create_session, \
+             patch("bot.upsert_user_provider_account_credentials", return_value={"id": 55}) as upsert_account, \
              patch("bot.record_command"):
             await cmd_connect_spotify(update, context)
 
         create_session.assert_called_once()
+        upsert_account.assert_called_once()
         self.assertEqual(create_session.call_args.kwargs["user_id"], 123)
         self.assertEqual(create_session.call_args.kwargs["provider"], "spotify")
         self.assertEqual(create_session.call_args.kwargs["state"], "state-abc")
@@ -533,6 +539,73 @@ class ConnectSpotifyTests(unittest.IsolatedAsyncioTestCase):
         reply_text = update.message.reply_text.await_args.kwargs["text"]
         self.assertIn("https://accounts.spotify.com/authorize", reply_text)
         self.assertIn("state-abc", reply_text)
+
+    async def test_cmd_reconnect_spotify_marks_existing_account_pending_oauth(self) -> None:
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=99),
+            effective_user=SimpleNamespace(id=42),
+            callback_query=None,
+            message=SimpleNamespace(reply_text=AsyncMock()),
+        )
+        context = SimpleNamespace(application=SimpleNamespace(bot_data={}))
+        user = {"id": 123}
+        spotify_account = {"id": 55, "provider": "spotify", "status": "connected", "is_active": True}
+
+        with patch.dict(
+            os.environ,
+            {
+                "SPOTIFY_CLIENT_ID": "client-123",
+                "SPOTIFY_REDIRECT_URI": "https://example.com/oauth/spotify/callback",
+            },
+            clear=False,
+        ), \
+             patch("bot.require_allowlisted_user", AsyncMock(return_value=user)), \
+             patch("bot.list_user_provider_accounts", return_value=[spotify_account]), \
+             patch("bot.generate_oauth_state", return_value="state-abc"), \
+             patch("bot.create_oauth_session", return_value={"id": 1}), \
+             patch("bot.mark_user_provider_account_status", return_value={**spotify_account, "status": "pending_oauth"}) as mark_status, \
+             patch("bot.record_command"):
+            await cmd_reconnect_spotify(update, context)
+
+        mark_status.assert_called_once_with(55, "pending_oauth")
+
+    async def test_cmd_disconnect_spotify_disables_existing_account(self) -> None:
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=99),
+            effective_user=SimpleNamespace(id=42),
+            callback_query=None,
+            message=SimpleNamespace(reply_text=AsyncMock()),
+        )
+        context = SimpleNamespace(application=SimpleNamespace(bot_data={}))
+        user = {"id": 123}
+        spotify_account = {"id": 55, "provider": "spotify", "status": "connected", "is_active": True}
+
+        with patch("bot.require_allowlisted_user", AsyncMock(return_value=user)), \
+             patch("bot.list_user_provider_accounts", return_value=[spotify_account]), \
+             patch("bot.disable_user_provider_account", return_value={**spotify_account, "status": "disabled", "is_active": False}) as disable_account, \
+             patch("bot.record_command"):
+            await cmd_disconnect_spotify(update, context)
+
+        disable_account.assert_called_once_with(55)
+        reply_text = update.message.reply_text.await_args.kwargs["text"]
+        self.assertIn("Spotify disconnected", reply_text)
+
+    async def test_cmd_help_lists_available_commands(self) -> None:
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=99),
+            effective_user=SimpleNamespace(id=42),
+            callback_query=None,
+            message=SimpleNamespace(reply_text=AsyncMock()),
+        )
+        context = SimpleNamespace(application=SimpleNamespace(bot_data={}))
+
+        with patch("bot.record_command"), patch("bot.build_keyboard", return_value=None):
+            await cmd_help(update, context)
+
+        reply_text = update.message.reply_text.await_args.kwargs["text"]
+        self.assertIn("/connect_spotify", reply_text)
+        self.assertIn("/disconnect_spotify", reply_text)
+        self.assertIn("/help", reply_text)
 
 
 class StatusCommandTests(unittest.IsolatedAsyncioTestCase):
@@ -552,7 +625,7 @@ class StatusCommandTests(unittest.IsolatedAsyncioTestCase):
             "provider": "spotify",
             "status": "connected",
             "granted_scope": "user-library-read",
-            "token_expires_at": datetime(2026, 3, 15, 13, 0, tzinfo=timezone.utc),
+            "token_expires_at": datetime(2099, 3, 15, 13, 0, tzinfo=timezone.utc),
             "last_auth_at": datetime(2026, 3, 15, 12, 0, tzinfo=timezone.utc),
             "last_refresh_at": datetime(2026, 3, 15, 12, 10, tzinfo=timezone.utc),
         }
@@ -565,6 +638,7 @@ class StatusCommandTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("bot.require_allowlisted_user", AsyncMock(return_value=user)), \
              patch("bot.get_active_user_provider_account", return_value=provider_account), \
+             patch("bot.list_user_provider_accounts", return_value=[provider_account]), \
              patch("bot.get_user_settings", return_value={"timezone": "UTC", "daily_time_local": dt_time(9, 0)}), \
              patch("bot.get_user_delivery_stats", return_value={"total_deliveries": 3, "latest_cycle_number": 2, "latest_cycle_count": 1, "last_delivered_at": None}), \
              patch("bot.list_recent_deliveries", return_value=[]), \
@@ -574,8 +648,11 @@ class StatusCommandTests(unittest.IsolatedAsyncioTestCase):
             await cmd_status(update, context)
 
         reply_text = update.message.reply_text.await_args.kwargs["text"]
+        self.assertIn("Provider status: connected", reply_text)
+        self.assertIn("Token expiry state: ok", reply_text)
+        self.assertIn("Reauth needed: no", reply_text)
         self.assertIn("Granted scope: user-library-read", reply_text)
-        self.assertIn("Token expires: 2026-03-15 13:00:00 UTC", reply_text)
+        self.assertIn("Token expires: 2099-03-15 13:00:00 UTC", reply_text)
         self.assertIn("Last auth: 2026-03-15 12:00:00 UTC", reply_text)
         self.assertIn("Last token refresh: 2026-03-15 12:10:00 UTC", reply_text)
 
