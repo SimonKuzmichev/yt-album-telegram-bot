@@ -334,6 +334,8 @@ class DeliveryHistoryIntegrationTests(PostgresIntegrationTestCase):
 class ProviderAccountIntegrationTests(PostgresIntegrationTestCase):
     def test_upsert_user_provider_account_credentials_encrypts_and_loads_credentials(self) -> None:
         user_id = self.create_user(telegram_user_id=1500, telegram_chat_id=2500, username="provider_user")
+        last_auth_at = datetime.now(timezone.utc).replace(microsecond=0)
+        last_refresh_at = last_auth_at + timedelta(minutes=5)
 
         row = db.upsert_user_provider_account_credentials(
             user_id=user_id,
@@ -341,11 +343,14 @@ class ProviderAccountIntegrationTests(PostgresIntegrationTestCase):
             credentials={"cookie_blob": "secret-cookie", "visitor_data": "abc123"},
             status="connected",
             is_active=True,
+            granted_scope="library.read",
+            last_auth_at=last_auth_at,
+            last_refresh_at=last_refresh_at,
         )
 
         db_row = self.query_one(
             """
-            SELECT id, provider, credentials_encrypted, is_active
+            SELECT id, provider, credentials_encrypted, is_active, granted_scope, last_auth_at, last_refresh_at
             FROM app.user_provider_accounts
             WHERE id = %s
             """,
@@ -354,6 +359,9 @@ class ProviderAccountIntegrationTests(PostgresIntegrationTestCase):
 
         self.assertEqual(db_row["provider"], "ytmusic")
         self.assertTrue(db_row["is_active"])
+        self.assertEqual(db_row["granted_scope"], "library.read")
+        self.assertEqual(db_row["last_auth_at"], last_auth_at)
+        self.assertEqual(db_row["last_refresh_at"], last_refresh_at)
         self.assertTrue(str(db_row["credentials_encrypted"]).startswith("fernet:v1:"))
         self.assertNotIn("secret-cookie", str(db_row["credentials_encrypted"]))
 

@@ -175,6 +175,11 @@ class HealthcheckServerTests(unittest.TestCase):
         upsert_account.assert_called_once()
         self.assertEqual(upsert_account.call_args.kwargs["provider"], "spotify")
         self.assertEqual(upsert_account.call_args.kwargs["status"], "connected")
+        self.assertEqual(upsert_account.call_args.kwargs["granted_scope"], "user-library-read")
+        self.assertEqual(
+            upsert_account.call_args.kwargs["last_auth_at"],
+            datetime(2026, 3, 15, 12, 0, tzinfo=timezone.utc),
+        )
         self.assertEqual(
             upsert_account.call_args.kwargs["credentials"]["refresh_token"],
             "secret-refresh-token",

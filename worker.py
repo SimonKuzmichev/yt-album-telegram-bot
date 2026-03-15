@@ -38,6 +38,7 @@ from src.db import (
     list_cycle_album_ids,
     list_provider_accounts_due_for_sync,
     upsert_user_library_albums,
+    upsert_user_provider_account_credentials,
 )
 from src.errors import is_auth_error, is_rate_limited
 from src.logging_utils import configure_logging, log_event
@@ -288,6 +289,33 @@ def _build_provider_client_for_account(account: dict, credentials: dict):
     return build_provider_client(str(account["provider"]), credentials=credentials)
 
 
+def _persist_provider_client_updates(account: dict, provider_client: object) -> None:
+    user_id = account.get("user_id")
+    if user_id is None:
+        return
+
+    get_updated_credentials = getattr(provider_client, "get_updated_credentials", None)
+    if not callable(get_updated_credentials):
+        return
+
+    updated_credentials = get_updated_credentials()
+    if not updated_credentials:
+        return
+
+    get_account_metadata_updates = getattr(provider_client, "get_account_metadata_updates", None)
+    metadata_updates = get_account_metadata_updates() if callable(get_account_metadata_updates) else {}
+    upsert_user_provider_account_credentials(
+        user_id=int(user_id),
+        provider=str(account["provider"]),
+        credentials=updated_credentials,
+        status=str(account.get("status") or PROVIDER_ACCOUNT_STATUS_CONNECTED),
+        is_active=bool(account.get("is_active", True)),
+        token_expires_at=metadata_updates.get("token_expires_at"),
+        granted_scope=metadata_updates.get("granted_scope"),
+        last_refresh_at=metadata_updates.get("last_refresh_at"),
+    )
+
+
 def _sync_log_fields(
     *,
     account: dict,
@@ -328,6 +356,7 @@ def _sync_provider_account(cfg: WorkerConfig, account: dict, sync_job_id: UUID |
     provider_client = _build_provider_client_for_account(account, credentials)
     try:
         albums = provider_client.list_saved_albums(limit=cfg.library_limit)
+        _persist_provider_client_updates(account, provider_client)
         synced_count = upsert_user_library_albums(account_id, albums)
         result_status = SYNC_RESULT_EMPTY_LIBRARY if synced_count == 0 else SYNC_RESULT_OK
         mark_user_provider_sync_succeeded(account_id, library_item_count=synced_count, result_status=result_status)
@@ -500,6 +529,7 @@ def _execute_revalidate_provider_job(cfg: WorkerConfig, job: dict) -> None:
     provider_client = _build_provider_client_for_account(account, credentials)
     try:
         provider_client.validate_credentials()
+        _persist_provider_client_updates(account, provider_client)
         mark_user_provider_account_status(account_id, PROVIDER_ACCOUNT_STATUS_CONNECTED)
         log_event(
             logger,

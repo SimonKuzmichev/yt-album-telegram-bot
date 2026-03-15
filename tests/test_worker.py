@@ -192,6 +192,45 @@ class SyncProviderAccountTests(unittest.TestCase):
         mark_succeeded.assert_called_once_with(55, library_item_count=0, result_status="empty_library")
         mark_status.assert_not_called()
 
+    def test_persists_provider_credentials_after_runtime_refresh(self) -> None:
+        cfg = SimpleNamespace(library_limit=10)
+        account = {
+            "id": 55,
+            "user_id": 88,
+            "provider": "spotify",
+            "status": "connected",
+            "is_active": True,
+        }
+        provider_client = SimpleNamespace(
+            list_saved_albums=lambda limit=None: [{"provider_album_id": "a-1"}],
+            get_updated_credentials=lambda: {
+                "access_token": "new-access-token",
+                "refresh_token": "secret-refresh-token",
+                "token_expires_at": "2026-03-15T13:00:00+00:00",
+            },
+            get_account_metadata_updates=lambda: {
+                "token_expires_at": datetime(2026, 3, 15, 13, 0, tzinfo=timezone.utc),
+                "granted_scope": "user-library-read",
+                "last_refresh_at": datetime(2026, 3, 15, 12, 0, tzinfo=timezone.utc),
+            },
+        )
+
+        with patch.object(worker, "get_user_provider_account_credentials", return_value={"refresh_token": "secret"}), \
+             patch.object(worker, "mark_user_provider_sync_started"), \
+             patch.object(worker, "build_provider_client", return_value=provider_client), \
+             patch.object(worker, "upsert_user_provider_account_credentials") as upsert_credentials, \
+             patch.object(worker, "upsert_user_library_albums", return_value=1), \
+             patch.object(worker, "mark_user_provider_sync_succeeded"), \
+             patch.object(worker, "provider_sync_total", _MetricProbe()), \
+             patch.object(worker, "provider_sync_failures_total", _MetricProbe()), \
+             patch.object(worker, "provider_sync_duration_seconds", _MetricProbe()):
+            _sync_provider_account(cfg, account)
+
+        upsert_credentials.assert_called_once()
+        self.assertEqual(upsert_credentials.call_args.kwargs["user_id"], 88)
+        self.assertEqual(upsert_credentials.call_args.kwargs["provider"], "spotify")
+        self.assertEqual(upsert_credentials.call_args.kwargs["granted_scope"], "user-library-read")
+
     def test_logs_structured_sync_failure_fields(self) -> None:
         cfg = SimpleNamespace(library_limit=10)
         account = {"id": 55, "provider": "ytmusic", "status": "connected"}

@@ -1200,6 +1200,9 @@ def upsert_user_provider_account_credentials(
     status: str = PROVIDER_ACCOUNT_STATUS_CONNECTED,
     is_active: bool = True,
     token_expires_at: Optional[datetime] = None,
+    granted_scope: Optional[str] = None,
+    last_auth_at: Optional[datetime] = None,
+    last_refresh_at: Optional[datetime] = None,
 ) -> ProviderAccountRow:
     logger.debug(
         "DB upsert_user_provider_account_credentials started user_id=%s provider=%s is_active=%s",
@@ -1234,15 +1237,21 @@ def upsert_user_provider_account_credentials(
                             status,
                             is_active,
                             credentials_encrypted,
-                            token_expires_at
+                            token_expires_at,
+                            granted_scope,
+                            last_auth_at,
+                            last_refresh_at
                         )
-                        VALUES (%s, %s, %s, %s, %s, %s)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT (user_id, provider)
                         DO UPDATE SET
                             status = EXCLUDED.status,
                             is_active = EXCLUDED.is_active,
                             credentials_encrypted = EXCLUDED.credentials_encrypted,
                             token_expires_at = EXCLUDED.token_expires_at,
+                            granted_scope = EXCLUDED.granted_scope,
+                            last_auth_at = COALESCE(EXCLUDED.last_auth_at, app.user_provider_accounts.last_auth_at),
+                            last_refresh_at = COALESCE(EXCLUDED.last_refresh_at, app.user_provider_accounts.last_refresh_at),
                             updated_at = NOW()
                         RETURNING
                             id,
@@ -1251,6 +1260,9 @@ def upsert_user_provider_account_credentials(
                             status,
                             is_active,
                             token_expires_at,
+                            granted_scope,
+                            last_auth_at,
+                            last_refresh_at,
                             created_at,
                             updated_at
                         """,
@@ -1261,6 +1273,9 @@ def upsert_user_provider_account_credentials(
                             is_active,
                             encrypted_credentials,
                             token_expires_at,
+                            granted_scope,
+                            last_auth_at,
+                            last_refresh_at,
                         ),
                     )
                     row = cur.fetchone()
@@ -1297,6 +1312,9 @@ def get_active_user_provider_account(user_id: int) -> Optional[ProviderAccountRo
                             status,
                             is_active,
                             token_expires_at,
+                            granted_scope,
+                            last_auth_at,
+                            last_refresh_at,
                             created_at,
                             updated_at
                         FROM app.user_provider_accounts
@@ -1334,6 +1352,9 @@ def list_user_provider_accounts(user_id: int) -> List[ProviderAccountRow]:
                             status,
                             is_active,
                             token_expires_at,
+                            granted_scope,
+                            last_auth_at,
+                            last_refresh_at,
                             created_at,
                             updated_at
                         FROM app.user_provider_accounts
@@ -1366,6 +1387,9 @@ def set_active_user_provider_account(user_id: int, provider: str) -> Optional[Pr
                             status,
                             is_active,
                             token_expires_at,
+                            granted_scope,
+                            last_auth_at,
+                            last_refresh_at,
                             created_at,
                             updated_at
                         FROM app.user_provider_accounts
@@ -1399,6 +1423,9 @@ def set_active_user_provider_account(user_id: int, provider: str) -> Optional[Pr
                             status,
                             is_active,
                             token_expires_at,
+                            granted_scope,
+                            last_auth_at,
+                            last_refresh_at,
                             created_at,
                             updated_at
                         FROM app.user_provider_accounts
@@ -1470,6 +1497,9 @@ def get_user_provider_account_by_id(account_id: int) -> Optional[ProviderAccount
                             status,
                             is_active,
                             token_expires_at,
+                            granted_scope,
+                            last_auth_at,
+                            last_refresh_at,
                             created_at,
                             updated_at
                         FROM app.user_provider_accounts
@@ -1505,6 +1535,9 @@ def list_provider_accounts_due_for_sync(sync_before: datetime) -> List[ProviderA
                             pa.status,
                             pa.is_active,
                             pa.token_expires_at,
+                            pa.granted_scope,
+                            pa.last_auth_at,
+                            pa.last_refresh_at,
                             s.last_sync_started_at,
                             s.last_sync_finished_at,
                             s.last_successful_sync_at,
@@ -1556,6 +1589,9 @@ def mark_user_provider_account_status(account_id: int, status: str) -> Optional[
                             status,
                             is_active,
                             token_expires_at,
+                            granted_scope,
+                            last_auth_at,
+                            last_refresh_at,
                             created_at,
                             updated_at
                         """,

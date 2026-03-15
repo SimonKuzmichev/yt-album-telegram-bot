@@ -264,6 +264,12 @@ def _ensure_spotify_failure_account_state(user_id: int) -> None:
 
 def _mark_spotify_oauth_failed(*, session_id: int, user_id: int) -> None:
     try:
+        _log_bot_event(
+            "spotify_oauth_failed",
+            level=logging.WARNING,
+            message=f"spotify_oauth_failed oauth_session_id={session_id} provider=spotify",
+            user_id=user_id,
+        )
         update_oauth_session_status(
             session_id,
             OAUTH_SESSION_STATUS_FAILED,
@@ -344,6 +350,12 @@ def handle_spotify_callback(
 
     expires_at = session.get("expires_at")
     if isinstance(expires_at, datetime) and expires_at <= current_time:
+        _log_bot_event(
+            "spotify_oauth_expired",
+            level=logging.WARNING,
+            message=f"spotify_oauth_expired oauth_session_id={session['id']} provider=spotify expires_at={expires_at.isoformat()}",
+            user_id=session.get("user_id"),
+        )
         update_oauth_session_status(
             int(session["id"]),
             OAUTH_SESSION_STATUS_EXPIRED,
@@ -396,10 +408,13 @@ def handle_spotify_callback(
                 "refresh_token": token_payload["refresh_token"],
                 "token_type": token_payload["token_type"],
                 "granted_scope": token_payload["granted_scope"],
+                "token_expires_at": token_expires_at.isoformat(),
             },
             status=PROVIDER_ACCOUNT_STATUS_CONNECTED,
             is_active=True,
             token_expires_at=token_expires_at,
+            granted_scope=token_payload["granted_scope"],
+            last_auth_at=current_time,
         )
     except Exception:
         logger.exception("Failed to persist Spotify credentials for oauth_session_id=%s", session.get("id"))
@@ -424,6 +439,15 @@ def handle_spotify_callback(
             code_present=True,
         )
 
+    _log_bot_event(
+        "spotify_oauth_connected",
+        message=(
+            f"spotify_oauth_connected oauth_session_id={session['id']} provider=spotify "
+            f"token_expires_at={token_expires_at.isoformat()}"
+        ),
+        user_id=session.get("user_id"),
+        telegram_chat_id=session.get("requested_chat_id"),
+    )
     _queue_spotify_initial_sync(
         user_id=int(session["user_id"]),
         provider_account_id=int(provider_account["id"]),

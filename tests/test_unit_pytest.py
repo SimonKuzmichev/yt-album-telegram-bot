@@ -24,7 +24,7 @@ from src.credentials_encryption import (  # noqa: E402
     redact_sensitive_mapping,
 )
 from src.metrics import classify_error  # noqa: E402
-from src.providers import YTMusicProviderClient, build_provider_client  # noqa: E402
+from src.providers import SpotifyProviderClient, YTMusicProviderClient, build_provider_client  # noqa: E402
 
 
 class _MetricProbe:
@@ -96,6 +96,19 @@ def test_build_provider_client_normalizes_provider_name() -> None:
     assert isinstance(client, YTMusicProviderClient)
 
 
+def test_build_provider_client_supports_spotify() -> None:
+    client = build_provider_client(
+        "spotify",
+        credentials={
+            "access_token": "secret-access-token",
+            "refresh_token": "secret-refresh-token",
+            "token_expires_at": "2026-03-15T13:00:00+00:00",
+        },
+    )
+
+    assert isinstance(client, SpotifyProviderClient)
+
+
 def test_ytmusic_provider_materialized_credentials_file_is_private_and_removed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -150,6 +163,112 @@ def test_ytmusic_provider_removes_materialized_credentials_file_on_failure(
         client.validate_credentials()
 
     assert not os.path.exists(str(observed["path"]))
+
+
+def test_spotify_provider_lists_saved_albums(monkeypatch: pytest.MonkeyPatch) -> None:
+    observed: dict[str, object] = {}
+
+    class FakeResponse:
+        def __init__(self, payload: dict[str, object], status_code: int = 200) -> None:
+            self._payload = payload
+            self.status_code = status_code
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    def fake_get(url: str, *, params=None, headers=None, timeout=None):
+        observed["url"] = url
+        observed["params"] = params
+        observed["headers"] = headers
+        observed["timeout"] = timeout
+        return FakeResponse(
+            {
+                "items": [
+                    {
+                        "added_at": "2026-03-15T12:00:00Z",
+                        "album": {
+                            "id": "album-1",
+                            "name": "Discovery",
+                            "artists": [{"name": "Daft Punk"}],
+                            "release_date": "2001-03-12",
+                            "external_urls": {"spotify": "https://open.spotify.com/album/album-1"},
+                            "images": [{"url": "https://image.test/1.jpg"}],
+                        },
+                    }
+                ],
+                "next": None,
+            }
+        )
+
+    monkeypatch.setattr("src.providers.requests.get", fake_get)
+    client = SpotifyProviderClient(
+        credentials={
+            "access_token": "secret-access-token",
+            "refresh_token": "secret-refresh-token",
+            "token_expires_at": "2099-03-15T13:00:00+00:00",
+        }
+    )
+
+    albums = client.list_saved_albums(limit=5)
+
+    assert [album["provider_album_id"] for album in albums] == ["album-1"]
+    assert albums[0]["artist"] == "Daft Punk"
+    assert observed["params"] == {"limit": 5, "offset": 0}
+    assert observed["headers"] == {"Authorization": "Bearer secret-access-token"}
+
+
+def test_spotify_provider_refreshes_expired_access_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    observed: dict[str, object] = {}
+
+    class FakeResponse:
+        def __init__(self, payload: dict[str, object], status_code: int = 200) -> None:
+            self._payload = payload
+            self.status_code = status_code
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    def fake_post(url: str, *, data=None, auth=None, timeout=None):
+        observed["refresh_url"] = url
+        observed["refresh_data"] = data
+        observed["refresh_auth"] = auth
+        return FakeResponse(
+            {
+                "access_token": "new-access-token",
+                "token_type": "Bearer",
+                "scope": "user-library-read",
+                "expires_in": 3600,
+            }
+        )
+
+    def fake_get(url: str, *, params=None, headers=None, timeout=None):
+        observed["headers"] = headers
+        return FakeResponse({"id": "spotify-user"})
+
+    monkeypatch.setenv("SPOTIFY_CLIENT_ID", "client-123")
+    monkeypatch.setenv("SPOTIFY_CLIENT_SECRET", "secret-456")
+    monkeypatch.setattr("src.providers.requests.post", fake_post)
+    monkeypatch.setattr("src.providers.requests.get", fake_get)
+    client = SpotifyProviderClient(
+        credentials={
+            "access_token": "old-access-token",
+            "refresh_token": "secret-refresh-token",
+            "token_expires_at": "2020-03-15T13:00:00+00:00",
+        }
+    )
+
+    client.validate_credentials()
+    updated_credentials = client.get_updated_credentials()
+    metadata_updates = client.get_account_metadata_updates()
+
+    assert observed["refresh_auth"] == ("client-123", "secret-456")
+    assert observed["refresh_data"] == {"grant_type": "refresh_token", "refresh_token": "secret-refresh-token"}
+    assert observed["headers"] == {"Authorization": "Bearer new-access-token"}
+    assert updated_credentials is not None
+    assert updated_credentials["access_token"] == "new-access-token"
+    assert updated_credentials["refresh_token"] == "secret-refresh-token"
+    assert metadata_updates["granted_scope"] == "user-library-read"
+    assert metadata_updates["token_expires_at"].tzinfo is not None
 
 
 def test_sync_provider_account_recovers_needs_reauth_to_connected() -> None:
