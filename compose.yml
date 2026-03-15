@@ -9,12 +9,18 @@ services:
       DATABASE_URL: ${CONTAINER_DATABASE_URL:-postgresql://app:app@db:5432/ytabot}
       REDIS_URL: ${CONTAINER_REDIS_URL:-redis://redis:6379/0}
       HTTP_HOST: 0.0.0.0
+      HTTPS_PROXY: ${CONTAINER_PROXY_URL:-socks5h://host.docker.internal:2080}
+      HTTP_PROXY: ${CONTAINER_PROXY_URL:-socks5h://host.docker.internal:2080}
+      ALL_PROXY: ${CONTAINER_PROXY_URL:-socks5h://host.docker.internal:2080}
+      NO_PROXY: ${CONTAINER_NO_PROXY:-127.0.0.1,localhost,db,redis,prometheus,grafana,bot-app,worker,caddy}
     command: ["python", "bot.py"]
     depends_on:
       db:
         condition: service_healthy
       redis:
         condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     expose:
       - "8080"
       - "8000"
@@ -51,12 +57,18 @@ services:
     environment:
       DATABASE_URL: ${CONTAINER_DATABASE_URL:-postgresql://app:app@db:5432/ytabot}
       REDIS_URL: ${CONTAINER_REDIS_URL:-redis://redis:6379/0}
+      HTTPS_PROXY: ${CONTAINER_PROXY_URL:-socks5h://host.docker.internal:2080}
+      HTTP_PROXY: ${CONTAINER_PROXY_URL:-socks5h://host.docker.internal:2080}
+      ALL_PROXY: ${CONTAINER_PROXY_URL:-socks5h://host.docker.internal:2080}
+      NO_PROXY: ${CONTAINER_NO_PROXY:-127.0.0.1,localhost,db,redis,prometheus,grafana,bot-app,worker,caddy}
     command: ["python", "worker.py"]
     depends_on:
       db:
         condition: service_healthy
       redis:
         condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "8001:8001"
     restart: unless-stopped
