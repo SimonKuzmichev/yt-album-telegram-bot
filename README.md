@@ -48,6 +48,11 @@ PROMETHEUS_METRICS_PORT=8000
 HTTP_HOST=0.0.0.0
 HTTP_PORT=8080
 CADDY_SITE_ADDRESS=albums.example.com
+SPOTIFY_CLIENT_ID=...
+SPOTIFY_CLIENT_SECRET=...
+SPOTIFY_REDIRECT_URI=https://albums.example.com/oauth/spotify/callback
+SPOTIFY_OAUTH_STATE_TTL_SECONDS=600
+SPOTIFY_TOKEN_REFRESH_WINDOW_SECONDS=600
 WORKER_PROMETHEUS_METRICS_PORT=8001
 WORKER_POLL_SECONDS=15
 WORKER_DUE_WINDOW_SECONDS=60
@@ -61,6 +66,9 @@ Notes:
 - `REDIS_URL` is required by `bot.py` for command locks, request dedupe, and rate limiting.
 - `CONTAINER_DATABASE_URL` and `CONTAINER_REDIS_URL` are optional Compose-specific overrides. They default to the built-in `db` and `redis` service addresses.
 - `CADDY_SITE_ADDRESS` controls the public site address Caddy serves. Set it to your NAS hostname or public IP for automatic HTTPS; if omitted, Compose defaults it to `localhost`.
+- `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, and `SPOTIFY_REDIRECT_URI` are required for Spotify OAuth. `SPOTIFY_REDIRECT_URI` must exactly match the redirect URI configured in the Spotify app dashboard.
+- `SPOTIFY_OAUTH_STATE_TTL_SECONDS` controls how long a Spotify OAuth state remains valid before callback validation rejects it. The default is `600`.
+- `SPOTIFY_TOKEN_REFRESH_WINDOW_SECONDS` controls how early the worker refreshes Spotify access tokens before expiry. The default is `600`.
 - `ALLOWED_CHAT_ID` is only an admin override for admin-only commands such as `/approve`, `/block`, and `/admin_status`.
 - Daily scheduling is executed by `worker.py` using per-user settings stored in the DB.
 - `/refresh` now queues a sync for the calling user’s active provider account.
@@ -135,10 +143,14 @@ python3 scripts/get_chat_id.py
 ## Bot Commands
 
 - `/start` - register the user and show readiness
+- `/help` - show available user commands
+- `/connect_spotify` - start Spotify OAuth for the user
+- `/reconnect_spotify` - restart Spotify OAuth for an existing Spotify account
+- `/disconnect_spotify` - disable the Spotify account
 - `/now` - queue an immediate album delivery
 - `/nextcycle` - queue an album from the next cycle immediately
 - `/refresh` - queue a provider library sync for the current user
-- `/status` - show DB delivery stats and active provider status
+- `/status` - show DB delivery stats, provider status, and token/auth state
 - `/approve <telegram_user_id>` - admin-only: allow a registered user
 - `/block <telegram_user_id>` - admin-only: block a user
 - `/admin_status` - admin-only: show queue and user summary
@@ -206,11 +218,16 @@ Worker metrics include:
 - `provider_library_album_count{provider,user_id}`
 - `provider_accounts_total{provider,status}`
 - `provider_accounts_needs_reauth{provider}`
+- `provider_accounts_needing_reauth{provider}`
 - `job_queue_depth{type,status}`
+- `oauth_refresh_total{provider,result}`
+- `token_refresh_failures_total{provider}`
 
 Bot metrics include:
 
 - `commands_total{command,status}`
 - `rate_limit_hits_total{command}`
-
-`token_refresh_failures_total{provider}` is registered for future provider token-refresh flows; the current codebase does not perform refreshes yet.
+- `oauth_start_total{provider}`
+- `oauth_callback_total{provider,result}`
+- `oauth_token_exchange_total{provider,result}`
+- `oauth_state_validation_fail_total{provider}`
