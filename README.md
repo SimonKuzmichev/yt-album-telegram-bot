@@ -47,6 +47,7 @@ DEFAULT_TIMEZONE=UTC
 PROMETHEUS_METRICS_PORT=8000
 HTTP_HOST=0.0.0.0
 HTTP_PORT=8080
+CADDY_SITE_ADDRESS=albums.example.com
 WORKER_PROMETHEUS_METRICS_PORT=8001
 WORKER_POLL_SECONDS=15
 WORKER_DUE_WINDOW_SECONDS=60
@@ -59,12 +60,14 @@ Notes:
 - `DATABASE_URL` is required by both `bot.py` and `worker.py`.
 - `REDIS_URL` is required by `bot.py` for command locks, request dedupe, and rate limiting.
 - `CONTAINER_DATABASE_URL` and `CONTAINER_REDIS_URL` are optional Compose-specific overrides. They default to the built-in `db` and `redis` service addresses.
+- `CADDY_SITE_ADDRESS` controls the public site address Caddy serves. Set it to your NAS hostname or public IP for automatic HTTPS; if omitted, Compose defaults it to `localhost`.
 - `ALLOWED_CHAT_ID` is only an admin override for admin-only commands such as `/approve`, `/block`, and `/admin_status`.
 - Daily scheduling is executed by `worker.py` using per-user settings stored in the DB.
 - `/refresh` now queues a sync for the calling user’s active provider account.
 - `DAILY_TIME` is no longer used.
 - `bot.py` resolves its app timezone from the admin override user's DB settings when that user exists; otherwise it falls back to `DEFAULT_TIMEZONE`.
 - `bot.py` also exposes a tiny HTTP server on `HTTP_HOST:HTTP_PORT` for reverse-proxy health checks. By default it listens on `0.0.0.0:8080` and serves `GET /healthz`.
+- Compose now runs Caddy as the public reverse proxy. `bot-app` stays on the internal Compose network via `expose`, while Caddy publishes ports `80` and `443` and keeps certificates in named volumes.
 - `WORKER_JOB_LEASE_SECONDS` controls when `running` jobs are considered stale and requeued after a worker crash.
 - `PROVIDER_SYNC_INTERVAL_SECONDS` controls periodic background provider sync scheduling.
 - `NOW_RATE_LIMIT_HOURLY`, `NOW_RATE_LIMIT_DAILY`, `NEXTCYCLE_RATE_LIMIT_HOURLY`, `NEXTCYCLE_RATE_LIMIT_DAILY`, `REFRESH_RATE_LIMIT_HOURLY`, and `REFRESH_RATE_LIMIT_DAILY` are optional command rate-limit overrides.
@@ -103,7 +106,7 @@ python3 worker.py
 To run the full app stack with Compose instead:
 
 ```bash
-docker compose up -d --build bot-app worker
+docker compose up -d --build bot-app worker caddy
 ```
 
 To start the optional monitoring stack locally:
