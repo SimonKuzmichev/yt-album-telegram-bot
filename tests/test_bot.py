@@ -28,6 +28,7 @@ from bot import (  # noqa: E402
     cmd_refresh,
     get_command_lock_key,
     get_env_str,
+    get_http_response,
     get_request_dedupe_key,
     get_rate_limit_key,
     get_optional_env_int,
@@ -79,6 +80,20 @@ class GetEnvStrTests(unittest.TestCase):
     def test_returns_stripped_value(self) -> None:
         with patch.dict(os.environ, {"VALUE": " redis://localhost:6379/0 "}, clear=True):
             self.assertEqual(get_env_str("VALUE", "fallback"), "redis://localhost:6379/0")
+
+
+class HealthcheckServerTests(unittest.TestCase):
+    def test_healthz_returns_ok(self) -> None:
+        status_code, body = get_http_response("/healthz")
+
+        self.assertEqual(status_code, 200)
+        self.assertEqual(body, b"ok\n")
+
+    def test_unknown_path_returns_not_found(self) -> None:
+        status_code, body = get_http_response("/oauth/spotify/callback")
+
+        self.assertEqual(status_code, 404)
+        self.assertEqual(body, b"")
 
 
 class RateLimitHelperTests(unittest.TestCase):

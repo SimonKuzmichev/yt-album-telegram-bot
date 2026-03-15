@@ -1,6 +1,8 @@
 import logging
 import os
+import threading
 from datetime import datetime, time as dt_time, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from uuid import NAMESPACE_URL, uuid4, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Any, Dict, Optional
@@ -73,6 +75,44 @@ RATE_LIMIT_WINDOWS = {
     ),
 }
 logger = logging.getLogger(__name__)
+
+
+class HealthcheckHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+class HealthcheckRequestHandler(BaseHTTPRequestHandler):
+    server_version = "DailyYTAlbumBotHTTP/1.0"
+
+    def do_GET(self) -> None:  # noqa: N802 - stdlib naming convention
+        status_code, body = get_http_response(self.path)
+        if status_code == 200:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        self.send_error(status_code)
+
+    def log_message(self, format: str, *args: Any) -> None:
+        # Keep health checks out of stdout/stderr unless we explicitly log them.
+        return
+
+
+def start_http_server(host: str, port: int) -> HealthcheckHTTPServer:
+    http_server = HealthcheckHTTPServer((host, port), HealthcheckRequestHandler)
+    thread = threading.Thread(target=http_server.serve_forever, name="healthcheck-http", daemon=True)
+    thread.start()
+    return http_server
+
+
+def get_http_response(path: str) -> tuple[int, bytes]:
+    if path == "/healthz":
+        return 200, b"ok\n"
+    return 404, b""
 
 
 def _log_bot_event(
@@ -1311,6 +1351,8 @@ def main() -> None:
 
     library_limit = int(os.getenv("LIBRARY_LIMIT", "500"))
     redis_url = get_env_str("REDIS_URL", "redis://localhost:6379/0")
+    http_host = get_env_str("HTTP_HOST", "0.0.0.0")
+    http_port = get_env_int("HTTP_PORT", 8080)
     log_level_name = os.getenv("LOG_LEVEL", "INFO").strip().upper()
     log_level = getattr(logging, log_level_name, None)
     if not isinstance(log_level, int):
@@ -1320,13 +1362,15 @@ def main() -> None:
 
     configure_logging(log_level)
     start_metrics_server(get_optional_env_int("PROMETHEUS_METRICS_PORT") or 8000)
+    http_server = start_http_server(http_host, http_port)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     _log_bot_event(
         "bot_started",
         message=(
             f"bot_started tz={tz.key} "
-            f"library_limit={library_limit} allowed_chat_id={admin_chat_id_override}"
+            f"library_limit={library_limit} allowed_chat_id={admin_chat_id_override} "
+            f"http={http_host}:{http_port}"
         ),
     )
 
@@ -1359,7 +1403,11 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_callback))
 
     # Start polling (no public IP required)
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
+    finally:
+        http_server.shutdown()
+        http_server.server_close()
 
 
 if __name__ == "__main__":
