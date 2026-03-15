@@ -271,6 +271,33 @@ def test_spotify_provider_refreshes_expired_access_token(monkeypatch: pytest.Mon
     assert metadata_updates["token_expires_at"].tzinfo is not None
 
 
+def test_spotify_provider_records_refresh_failure_metric(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeResponse:
+        status_code = 400
+
+        def json(self) -> dict[str, object]:
+            return {"error": "invalid_grant", "error_description": "refresh token revoked"}
+
+    recorded: list[str] = []
+
+    monkeypatch.setenv("SPOTIFY_CLIENT_ID", "client-123")
+    monkeypatch.setenv("SPOTIFY_CLIENT_SECRET", "secret-456")
+    monkeypatch.setattr("src.providers.requests.post", lambda *args, **kwargs: FakeResponse())
+    monkeypatch.setattr("src.providers.record_token_refresh_failure", lambda provider: recorded.append(provider))
+    client = SpotifyProviderClient(
+        credentials={
+            "access_token": "old-access-token",
+            "refresh_token": "secret-refresh-token",
+            "token_expires_at": "2020-03-15T13:00:00+00:00",
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="invalid_grant"):
+        client.validate_credentials()
+
+    assert recorded == ["spotify"]
+
+
 def test_sync_provider_account_recovers_needs_reauth_to_connected() -> None:
     cfg = SimpleNamespace(library_limit=10)
     account = {"id": 55, "provider": "ytmusic", "status": "needs_reauth"}

@@ -28,6 +28,7 @@ from src.db import (
     insert_delivery_history,
     list_active_users_with_delivery_context,
     list_available_user_library_albums,
+    list_provider_accounts_needing_token_refresh,
     mark_job_failed,
     mark_job_succeeded,
     mark_user_provider_account_status,
@@ -64,6 +65,7 @@ JOB_TYPE_DELIVER_NOW = "deliver_now"
 JOB_TYPE_NEXT_CYCLE_NOW = "next_cycle_now"
 JOB_TYPE_SYNC_LIBRARY = "sync_library"
 JOB_TYPE_REVALIDATE_PROVIDER = "revalidate_provider"
+JOB_TYPE_REFRESH_PROVIDER_TOKEN = "refresh_provider_token"
 logger = logging.getLogger(__name__)
 
 
@@ -273,6 +275,63 @@ def enqueue_due_sync_jobs(cfg: WorkerConfig) -> int:
             "job_enqueued",
             job_id=row.get("id"),
             job_type=JOB_TYPE_SYNC_LIBRARY,
+            user_id=user_id,
+            attempt=row.get("attempt"),
+            idempotency_key=idem_key,
+            worker_id=cfg.worker_id,
+            provider=provider,
+            user_provider_account_id=account_id,
+            sync_job_id=row.get("id"),
+        )
+
+    return enqueued_count
+
+
+def enqueue_due_token_refresh_jobs(cfg: WorkerConfig) -> int:
+    now_utc = datetime.now(timezone.utc)
+    refresh_before = now_utc + timedelta(seconds=_get_env_int("SPOTIFY_TOKEN_REFRESH_WINDOW_SECONDS", 600))
+    accounts = list_provider_accounts_needing_token_refresh(refresh_before=refresh_before)
+    enqueued_count = 0
+
+    for account in accounts:
+        account_id = int(account["id"])
+        user_id = int(account["user_id"])
+        provider = str(account["provider"])
+        idem_key = f"refresh-token:{account_id}:{int(account['token_expires_at'].timestamp())}"
+        row = enqueue_job_once(
+            idempotency_key=idem_key,
+            idempotency_expires_at=refresh_before + timedelta(minutes=30),
+            job_id=uuid4(),
+            user_id=user_id,
+            job_type=JOB_TYPE_REFRESH_PROVIDER_TOKEN,
+            run_at=now_utc,
+            payload={
+                "idempotency_key": idem_key,
+                "user_provider_account_id": account_id,
+                "provider": provider,
+            },
+        )
+        if row is None:
+            log_event(
+                logger,
+                logging.INFO,
+                "provider_token_refresh_enqueue_skipped_idempotency",
+                job_type=JOB_TYPE_REFRESH_PROVIDER_TOKEN,
+                user_id=user_id,
+                idempotency_key=idem_key,
+                worker_id=cfg.worker_id,
+                provider=provider,
+                user_provider_account_id=account_id,
+            )
+            continue
+
+        enqueued_count += 1
+        log_event(
+            logger,
+            logging.INFO,
+            "job_enqueued",
+            job_id=row.get("id"),
+            job_type=JOB_TYPE_REFRESH_PROVIDER_TOKEN,
             user_id=user_id,
             attempt=row.get("attempt"),
             idempotency_key=idem_key,
@@ -567,6 +626,10 @@ def _execute_revalidate_provider_job(cfg: WorkerConfig, job: dict) -> None:
         raise
 
 
+def _execute_refresh_provider_token_job(cfg: WorkerConfig, job: dict) -> None:
+    _execute_revalidate_provider_job(cfg, job)
+
+
 async def process_claimed_jobs(bot: Bot, cfg: WorkerConfig) -> int:
     jobs = claim_runnable_jobs(worker_id=cfg.worker_id, batch_size=cfg.claim_batch_size)
     processed = 0
@@ -580,7 +643,7 @@ async def process_claimed_jobs(bot: Bot, cfg: WorkerConfig) -> int:
         chat_id = payload.get("telegram_chat_id")
         provider = payload.get("provider")
         user_provider_account_id = payload.get("user_provider_account_id")
-        sync_job_id = job_id if job_type in {JOB_TYPE_SYNC_LIBRARY, JOB_TYPE_REVALIDATE_PROVIDER} else None
+        sync_job_id = job_id if job_type in {JOB_TYPE_SYNC_LIBRARY, JOB_TYPE_REVALIDATE_PROVIDER, JOB_TYPE_REFRESH_PROVIDER_TOKEN} else None
 
         log_event(
             logger,
@@ -603,6 +666,8 @@ async def process_claimed_jobs(bot: Bot, cfg: WorkerConfig) -> int:
                 _execute_sync_job(cfg, job)
             elif job_type == JOB_TYPE_REVALIDATE_PROVIDER:
                 _execute_revalidate_provider_job(cfg, job)
+            elif job_type == JOB_TYPE_REFRESH_PROVIDER_TOKEN:
+                _execute_refresh_provider_token_job(cfg, job)
             elif job_type in {JOB_TYPE_DAILY_DELIVER, JOB_TYPE_DELIVER_NOW, JOB_TYPE_NEXT_CYCLE_NOW}:
                 await _execute_delivery_job(bot, cfg, job)
             else:
@@ -670,6 +735,7 @@ async def run_worker() -> None:
         try:
             enqueued = enqueue_due_jobs(cfg)
             sync_enqueued = enqueue_due_sync_jobs(cfg)
+            refresh_enqueued = enqueue_due_token_refresh_jobs(cfg)
             requeued = requeue_stale_running_jobs(cfg.job_lease_seconds)
             processed = await process_claimed_jobs(bot, cfg)
             if requeued:
@@ -686,7 +752,8 @@ async def run_worker() -> None:
                 "worker_loop_completed",
                 message=(
                     f"worker_loop_completed enqueued={enqueued} "
-                    f"sync_enqueued={sync_enqueued} requeued={requeued} processed={processed}"
+                    f"sync_enqueued={sync_enqueued} refresh_enqueued={refresh_enqueued} "
+                    f"requeued={requeued} processed={processed}"
                 ),
                 worker_id=cfg.worker_id,
             )

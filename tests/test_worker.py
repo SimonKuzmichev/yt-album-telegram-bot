@@ -17,6 +17,7 @@ from worker import (  # noqa: E402
     _is_due_now,
     _local_date_key,
     _sync_log_fields,
+    enqueue_due_token_refresh_jobs,
     _sync_provider_account,
 )
 
@@ -230,6 +231,42 @@ class SyncProviderAccountTests(unittest.TestCase):
         self.assertEqual(upsert_credentials.call_args.kwargs["user_id"], 88)
         self.assertEqual(upsert_credentials.call_args.kwargs["provider"], "spotify")
         self.assertEqual(upsert_credentials.call_args.kwargs["granted_scope"], "user-library-read")
+
+
+class TokenRefreshEnqueueTests(unittest.TestCase):
+    def test_enqueues_refresh_jobs_for_accounts_nearing_expiry(self) -> None:
+        cfg = SimpleNamespace(worker_id="worker-1")
+        account = {
+            "id": 55,
+            "user_id": 88,
+            "provider": "spotify",
+            "token_expires_at": datetime(2026, 3, 15, 12, 5, tzinfo=timezone.utc),
+        }
+
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                current = datetime(2026, 3, 15, 12, 0, tzinfo=timezone.utc)
+                if tz is None:
+                    return current.replace(tzinfo=None)
+                return current.astimezone(tz)
+
+        with patch.object(worker, "datetime", FixedDateTime), \
+             patch.object(worker, "list_provider_accounts_needing_token_refresh", return_value=[account]) as list_accounts, \
+             patch.object(worker, "enqueue_job_once", return_value={"id": "job-1", "attempt": 0}) as enqueue_job_once, \
+             patch.object(worker, "log_event"):
+            enqueued = enqueue_due_token_refresh_jobs(cfg)
+
+        self.assertEqual(enqueued, 1)
+        list_accounts.assert_called_once()
+        self.assertEqual(
+            enqueue_job_once.call_args.kwargs["job_type"],
+            worker.JOB_TYPE_REFRESH_PROVIDER_TOKEN,
+        )
+        self.assertEqual(
+            enqueue_job_once.call_args.kwargs["idempotency_key"],
+            "refresh-token:55:1773576300",
+        )
 
     def test_logs_structured_sync_failure_fields(self) -> None:
         cfg = SimpleNamespace(library_limit=10)

@@ -25,6 +25,7 @@ from bot import (  # noqa: E402
     build_spotify_callback_html,
     check_rate_limit,
     cmd_connect_spotify,
+    cmd_status,
     enforce_command_lock,
     enforce_request_dedupe,
     enforce_rate_limit,
@@ -532,6 +533,51 @@ class ConnectSpotifyTests(unittest.IsolatedAsyncioTestCase):
         reply_text = update.message.reply_text.await_args.kwargs["text"]
         self.assertIn("https://accounts.spotify.com/authorize", reply_text)
         self.assertIn("state-abc", reply_text)
+
+
+class StatusCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cmd_status_includes_provider_auth_timestamps(self) -> None:
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=99),
+            effective_user=SimpleNamespace(id=42),
+            callback_query=None,
+            message=SimpleNamespace(reply_text=AsyncMock()),
+        )
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={"tz": ZoneInfo("UTC")}),
+        )
+        user = {"id": 123, "allowlisted": True, "status": "active"}
+        provider_account = {
+            "id": 55,
+            "provider": "spotify",
+            "status": "connected",
+            "granted_scope": "user-library-read",
+            "token_expires_at": datetime(2026, 3, 15, 13, 0, tzinfo=timezone.utc),
+            "last_auth_at": datetime(2026, 3, 15, 12, 0, tzinfo=timezone.utc),
+            "last_refresh_at": datetime(2026, 3, 15, 12, 10, tzinfo=timezone.utc),
+        }
+        sync_state = {
+            "last_sync_result": "ok",
+            "last_successful_sync_at": datetime(2026, 3, 15, 12, 30, tzinfo=timezone.utc),
+            "last_error": None,
+            "library_item_count": 7,
+        }
+
+        with patch("bot.require_allowlisted_user", AsyncMock(return_value=user)), \
+             patch("bot.get_active_user_provider_account", return_value=provider_account), \
+             patch("bot.get_user_settings", return_value={"timezone": "UTC", "daily_time_local": dt_time(9, 0)}), \
+             patch("bot.get_user_delivery_stats", return_value={"total_deliveries": 3, "latest_cycle_number": 2, "latest_cycle_count": 1, "last_delivered_at": None}), \
+             patch("bot.list_recent_deliveries", return_value=[]), \
+             patch("bot.get_user_provider_sync_state", return_value=sync_state), \
+             patch("bot.record_command"), \
+             patch("bot.build_keyboard", return_value=None):
+            await cmd_status(update, context)
+
+        reply_text = update.message.reply_text.await_args.kwargs["text"]
+        self.assertIn("Granted scope: user-library-read", reply_text)
+        self.assertIn("Token expires: 2026-03-15 13:00:00 UTC", reply_text)
+        self.assertIn("Last auth: 2026-03-15 12:00:00 UTC", reply_text)
+        self.assertIn("Last token refresh: 2026-03-15 12:10:00 UTC", reply_text)
 
 
 class RateLimitTests(unittest.IsolatedAsyncioTestCase):

@@ -10,11 +10,13 @@ from urllib.parse import quote
 
 import requests
 
+from src.metrics import record_token_refresh_failure
+
 
 RawPayload = Dict[str, Any]
 SPOTIFY_API_BASE_URL = "https://api.spotify.com/v1"
 SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
-SPOTIFY_TOKEN_REFRESH_GRACE_SECONDS = 60
+SPOTIFY_TOKEN_REFRESH_GRACE_SECONDS = 600
 
 
 class NormalizedAlbum(TypedDict):
@@ -196,51 +198,55 @@ class SpotifyProviderClient:
         if not refresh_token:
             raise RuntimeError("Spotify refresh token is not configured")
 
-        client_id, client_secret = self._get_client_credentials()
-        response = requests.post(
-            SPOTIFY_TOKEN_URL,
-            data={
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-            },
-            auth=(client_id, client_secret),
-            timeout=15,
-        )
         try:
-            payload = response.json()
-        except ValueError as exc:
-            raise RuntimeError(f"Spotify token refresh returned invalid JSON (status={response.status_code})") from exc
+            client_id, client_secret = self._get_client_credentials()
+            response = requests.post(
+                SPOTIFY_TOKEN_URL,
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                },
+                auth=(client_id, client_secret),
+                timeout=15,
+            )
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise RuntimeError(f"Spotify token refresh returned invalid JSON (status={response.status_code})") from exc
 
-        if response.status_code >= 400:
-            error_code = payload.get("error") or "unknown_error"
-            error_description = payload.get("error_description") or "token refresh failed"
-            raise RuntimeError(f"Spotify token refresh failed: {error_code}: {error_description}")
+            if response.status_code >= 400:
+                error_code = payload.get("error") or "unknown_error"
+                error_description = payload.get("error_description") or "token refresh failed"
+                raise RuntimeError(f"Spotify token refresh failed: {error_code}: {error_description}")
 
-        access_token = _normalize_text(payload.get("access_token"))
-        token_type = _normalize_text(payload.get("token_type")) or "Bearer"
-        scope = _normalize_text(payload.get("scope")) or _normalize_text(self.credentials.get("granted_scope"))
-        returned_refresh_token = _normalize_text(payload.get("refresh_token"))
-        expires_in = payload.get("expires_in")
-        if not access_token or expires_in is None:
-            raise RuntimeError("Spotify token refresh response was missing required fields")
-        try:
-            expires_in_seconds = int(expires_in)
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError("Spotify token refresh returned an invalid expires_in value") from exc
+            access_token = _normalize_text(payload.get("access_token"))
+            token_type = _normalize_text(payload.get("token_type")) or "Bearer"
+            scope = _normalize_text(payload.get("scope")) or _normalize_text(self.credentials.get("granted_scope"))
+            returned_refresh_token = _normalize_text(payload.get("refresh_token"))
+            expires_in = payload.get("expires_in")
+            if not access_token or expires_in is None:
+                raise RuntimeError("Spotify token refresh response was missing required fields")
+            try:
+                expires_in_seconds = int(expires_in)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("Spotify token refresh returned an invalid expires_in value") from exc
 
-        refreshed_at = datetime.now(timezone.utc)
-        expires_at = refreshed_at + timedelta(seconds=expires_in_seconds)
-        self.credentials["access_token"] = access_token
-        self.credentials["token_type"] = token_type
-        self.credentials["granted_scope"] = scope
-        self.credentials["token_expires_at"] = expires_at.isoformat()
-        if returned_refresh_token:
-            self.credentials["refresh_token"] = returned_refresh_token
-        self._account_metadata_updates = {
-            "token_expires_at": expires_at,
-            "granted_scope": scope or None,
-            "last_refresh_at": refreshed_at,
-        }
+            refreshed_at = datetime.now(timezone.utc)
+            expires_at = refreshed_at + timedelta(seconds=expires_in_seconds)
+            self.credentials["access_token"] = access_token
+            self.credentials["token_type"] = token_type
+            self.credentials["granted_scope"] = scope
+            self.credentials["token_expires_at"] = expires_at.isoformat()
+            if returned_refresh_token:
+                self.credentials["refresh_token"] = returned_refresh_token
+            self._account_metadata_updates = {
+                "token_expires_at": expires_at,
+                "granted_scope": scope or None,
+                "last_refresh_at": refreshed_at,
+            }
+        except Exception:
+            record_token_refresh_failure(self.provider_name)
+            raise
 
     def _get_access_token(self) -> str:
         if not self._access_token_is_fresh():

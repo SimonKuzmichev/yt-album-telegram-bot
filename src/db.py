@@ -1569,6 +1569,50 @@ def list_provider_accounts_due_for_sync(sync_before: datetime) -> List[ProviderA
         raise
 
 
+def list_provider_accounts_needing_token_refresh(refresh_before: datetime) -> List[ProviderAccountRow]:
+    logger.debug("DB list_provider_accounts_needing_token_refresh started refresh_before=%s", refresh_before)
+    try:
+        with open_db_connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT
+                            pa.id,
+                            pa.user_id,
+                            pa.provider,
+                            pa.status,
+                            pa.is_active,
+                            pa.token_expires_at,
+                            pa.granted_scope,
+                            pa.last_auth_at,
+                            pa.last_refresh_at,
+                            pa.created_at,
+                            pa.updated_at
+                        FROM app.user_provider_accounts AS pa
+                        JOIN app.users AS u ON u.id = pa.user_id
+                        WHERE u.allowlisted = TRUE
+                          AND u.status = 'active'
+                          AND pa.is_active = TRUE
+                          AND pa.status = %s
+                          AND pa.provider = 'spotify'
+                          AND pa.token_expires_at IS NOT NULL
+                          AND pa.token_expires_at <= %s
+                        ORDER BY pa.token_expires_at ASC, pa.id ASC
+                        """,
+                        (PROVIDER_ACCOUNT_STATUS_CONNECTED, refresh_before),
+                    )
+                    rows = cur.fetchall()
+        logger.debug("DB list_provider_accounts_needing_token_refresh done count=%s", len(rows))
+        return rows
+    except Exception:
+        logger.exception(
+            "DB list_provider_accounts_needing_token_refresh failed refresh_before=%s",
+            refresh_before,
+        )
+        raise
+
+
 def mark_user_provider_account_status(account_id: int, status: str) -> Optional[ProviderAccountRow]:
     logger.debug("DB mark_user_provider_account_status started account_id=%s status=%s", account_id, status)
     try:

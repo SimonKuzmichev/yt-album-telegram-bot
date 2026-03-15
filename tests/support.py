@@ -106,6 +106,7 @@ def install_module_stubs() -> None:
             "list_available_user_library_albums",
             "list_cycle_album_ids",
             "list_provider_accounts_due_for_sync",
+            "list_provider_accounts_needing_token_refresh",
             "list_recent_deliveries",
             "mark_job_failed",
             "mark_job_succeeded",
