@@ -86,6 +86,36 @@ provider_accounts_needs_reauth = Gauge(
     "Provider accounts needing reauth by provider.",
     ["provider"],
 )
+provider_accounts_needing_reauth = Gauge(
+    "provider_accounts_needing_reauth",
+    "Provider accounts needing reauth by provider.",
+    ["provider"],
+)
+oauth_start_total = Counter(
+    "oauth_start_total",
+    "OAuth start attempts by provider.",
+    ["provider"],
+)
+oauth_callback_total = Counter(
+    "oauth_callback_total",
+    "OAuth callback outcomes by provider and result.",
+    ["provider", "result"],
+)
+oauth_token_exchange_total = Counter(
+    "oauth_token_exchange_total",
+    "OAuth token exchange outcomes by provider and result.",
+    ["provider", "result"],
+)
+oauth_refresh_total = Counter(
+    "oauth_refresh_total",
+    "OAuth token refresh outcomes by provider and result.",
+    ["provider", "result"],
+)
+oauth_state_validation_fail_total = Counter(
+    "oauth_state_validation_fail_total",
+    "OAuth state validation failures by provider.",
+    ["provider"],
+)
 token_refresh_failures_total = Counter(
     "token_refresh_failures_total",
     "Provider token refresh failures by provider.",
@@ -154,9 +184,39 @@ def record_token_refresh_failure(provider: str) -> None:
     token_refresh_failures_total.labels(provider=normalize_provider(provider)).inc()
 
 
+def record_oauth_start(provider: str) -> None:
+    oauth_start_total.labels(provider=normalize_provider(provider)).inc()
+
+
+def record_oauth_callback(provider: str, result: str) -> None:
+    oauth_callback_total.labels(
+        provider=normalize_provider(provider),
+        result=normalize_status(result),
+    ).inc()
+
+
+def record_oauth_token_exchange(provider: str, result: str) -> None:
+    oauth_token_exchange_total.labels(
+        provider=normalize_provider(provider),
+        result=normalize_status(result),
+    ).inc()
+
+
+def record_oauth_refresh(provider: str, result: str) -> None:
+    oauth_refresh_total.labels(
+        provider=normalize_provider(provider),
+        result=normalize_status(result),
+    ).inc()
+
+
+def record_oauth_state_validation_failure(provider: str) -> None:
+    oauth_state_validation_fail_total.labels(provider=normalize_provider(provider)).inc()
+
+
 def update_runtime_snapshot(snapshot: dict[str, list[dict[str, Any]]]) -> None:
     provider_accounts_total.clear()
     provider_accounts_needs_reauth.clear()
+    provider_accounts_needing_reauth.clear()
     provider_library_album_count.clear()
     job_queue_depth.clear()
 
@@ -168,6 +228,9 @@ def update_runtime_snapshot(snapshot: dict[str, list[dict[str, Any]]]) -> None:
 
     for row in snapshot.get("provider_needs_reauth", []):
         provider_accounts_needs_reauth.labels(
+            provider=normalize_provider(row.get("provider")),
+        ).set(int(row.get("count") or 0))
+        provider_accounts_needing_reauth.labels(
             provider=normalize_provider(row.get("provider")),
         ).set(int(row.get("count") or 0))
 

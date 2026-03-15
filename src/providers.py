@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import json
 import tempfile
@@ -10,13 +11,15 @@ from urllib.parse import quote
 
 import requests
 
-from src.metrics import record_token_refresh_failure
+from src.logging_utils import log_event
+from src.metrics import record_oauth_refresh, record_token_refresh_failure
 
 
 RawPayload = Dict[str, Any]
 SPOTIFY_API_BASE_URL = "https://api.spotify.com/v1"
 SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 SPOTIFY_TOKEN_REFRESH_GRACE_SECONDS = 600
+logger = logging.getLogger(__name__)
 
 
 class NormalizedAlbum(TypedDict):
@@ -244,8 +247,25 @@ class SpotifyProviderClient:
                 "granted_scope": scope or None,
                 "last_refresh_at": refreshed_at,
             }
+            record_oauth_refresh(self.provider_name, "success")
+            log_event(
+                logger,
+                logging.INFO,
+                "oauth_refresh_succeeded",
+                message=f"oauth_refresh_succeeded provider=spotify token_expires_at={expires_at.isoformat()}",
+                provider=self.provider_name,
+            )
         except Exception:
+            record_oauth_refresh(self.provider_name, "failed")
             record_token_refresh_failure(self.provider_name)
+            log_event(
+                logger,
+                logging.ERROR,
+                "oauth_refresh_failed",
+                exc_info=True,
+                message="oauth_refresh_failed provider=spotify",
+                provider=self.provider_name,
+            )
             raise
 
     def _get_access_token(self) -> str:

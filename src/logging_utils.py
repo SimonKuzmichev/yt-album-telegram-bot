@@ -6,6 +6,7 @@ from typing import Any
 
 LOG_FIELDS = (
     "event",
+    "oauth_session_id",
     "job_id",
     "job_type",
     "user_id",
