@@ -72,6 +72,10 @@ def install_module_stubs() -> None:
 
     if "src.db" not in sys.modules:
         db = ModuleType("src.db")
+        db.OAUTH_SESSION_STATUS_CONSUMED = "consumed"
+        db.OAUTH_SESSION_STATUS_EXPIRED = "expired"
+        db.OAUTH_SESSION_STATUS_FAILED = "failed"
+        db.OAUTH_SESSION_STATUS_PENDING = "pending"
         db.PROVIDER_ACCOUNT_STATUS_CONNECTED = "connected"
         db.PROVIDER_ACCOUNT_STATUS_NEEDS_REAUTH = "needs_reauth"
         db.SYNC_RESULT_AUTH_ERROR = "auth_error"
@@ -82,11 +86,13 @@ def install_module_stubs() -> None:
             "approve_user",
             "block_user",
             "claim_runnable_jobs",
+            "create_oauth_session",
             "enqueue_job_once",
             "ensure_user_settings",
             "get_active_user_provider_account",
             "get_admin_status_snapshot",
             "get_metrics_snapshot",
+            "get_oauth_session_by_state",
             "get_user_provider_sync_state",
             "get_latest_cycle_number",
             "get_user_provider_account_by_id",
@@ -111,6 +117,7 @@ def install_module_stubs() -> None:
             "set_active_user_provider_account",
             "set_user_daily_time",
             "set_user_timezone",
+            "update_oauth_session_status",
             "upsert_user_library_albums",
             "upsert_user",
         ]:

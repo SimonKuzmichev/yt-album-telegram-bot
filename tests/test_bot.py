@@ -12,6 +12,7 @@ install_module_stubs()
 
 from bot import (  # noqa: E402
     COMMAND_LOCK_TTLS_SECONDS,
+    DEFAULT_OAUTH_STATE_TTL_SECONDS,
     RATE_LIMIT_WINDOWS,
     _fmt_ts,
     _is_admin_override_chat,
@@ -20,11 +21,15 @@ from bot import (  # noqa: E402
     _query_param_present,
     acquire_command_lock,
     acquire_request_dedupe,
+    build_spotify_authorize_url,
     build_spotify_callback_html,
     check_rate_limit,
+    cmd_connect_spotify,
     enforce_command_lock,
     enforce_request_dedupe,
     enforce_rate_limit,
+    generate_oauth_state,
+    get_spotify_oauth_state_ttl_seconds,
     cmd_nextcycle,
     cmd_now,
     cmd_refresh,
@@ -34,6 +39,7 @@ from bot import (  # noqa: E402
     get_rate_limit_key,
     get_optional_env_int,
     get_request_id,
+    handle_spotify_callback,
     parse_time_hhmm,
     resolve_app_timezone,
 )
@@ -85,16 +91,26 @@ class GetEnvStrTests(unittest.TestCase):
 
 class HealthcheckServerTests(unittest.TestCase):
     def test_spotify_callback_echoes_presence_without_secret_values(self) -> None:
-        html = build_spotify_callback_html(state_present=True, code_present=True)
+        html = build_spotify_callback_html(
+            title="Spotify authorization received",
+            message="Spotify returned successfully. You can go back to Telegram.",
+            state_present=True,
+            code_present=True,
+        )
 
-        self.assertIn("Spotify callback reached", html)
+        self.assertIn("Spotify authorization received", html)
         self.assertIn("state present: yes", html)
         self.assertIn("code present: yes", html)
         self.assertNotIn("abc123", html)
         self.assertNotIn("secret-code", html)
 
     def test_spotify_callback_reports_missing_values(self) -> None:
-        html = build_spotify_callback_html(state_present=False, code_present=False)
+        html = build_spotify_callback_html(
+            title="Invalid Spotify callback",
+            message="Missing state parameter.",
+            state_present=False,
+            code_present=False,
+        )
 
         self.assertIn("state present: no", html)
         self.assertIn("code present: no", html)
@@ -103,6 +119,85 @@ class HealthcheckServerTests(unittest.TestCase):
         self.assertTrue(_query_param_present("abc123"))
         self.assertFalse(_query_param_present(""))
         self.assertFalse(_query_param_present(None))
+
+    def test_generate_oauth_state_returns_urlsafe_random_value(self) -> None:
+        first = generate_oauth_state()
+        second = generate_oauth_state()
+
+        self.assertNotEqual(first, second)
+        self.assertGreaterEqual(len(first), 24)
+        self.assertNotIn("=", first)
+
+    def test_spotify_oauth_state_ttl_uses_default(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(get_spotify_oauth_state_ttl_seconds(), DEFAULT_OAUTH_STATE_TTL_SECONDS)
+
+    def test_build_spotify_authorize_url_includes_state_and_redirect_uri(self) -> None:
+        url = build_spotify_authorize_url(
+            client_id="client-123",
+            redirect_uri="https://example.com/oauth/spotify/callback",
+            state="state-abc",
+        )
+
+        self.assertIn("accounts.spotify.com/authorize", url)
+        self.assertIn("client_id=client-123", url)
+        self.assertIn("response_type=code", url)
+        self.assertIn("state=state-abc", url)
+        self.assertIn("redirect_uri=https%3A%2F%2Fexample.com%2Foauth%2Fspotify%2Fcallback", url)
+
+    def test_handle_spotify_callback_consumes_pending_session(self) -> None:
+        session = {
+            "id": 7,
+            "status": "pending",
+            "expires_at": datetime(2026, 3, 15, 12, 30, tzinfo=timezone.utc),
+        }
+
+        with patch("bot.get_oauth_session_by_state", return_value=session), \
+             patch("bot.update_oauth_session_status", return_value={**session, "status": "consumed"}) as update_status:
+            html = handle_spotify_callback(
+                state="state-abc",
+                code="code-123",
+                now_utc=datetime(2026, 3, 15, 12, 0, tzinfo=timezone.utc),
+            )
+
+        update_status.assert_called_once_with(7, "consumed", expected_current_status="pending")
+        self.assertIn("Spotify authorization received", html)
+
+    def test_handle_spotify_callback_marks_expired_session(self) -> None:
+        session = {
+            "id": 7,
+            "status": "pending",
+            "expires_at": datetime(2026, 3, 15, 11, 30, tzinfo=timezone.utc),
+        }
+
+        with patch("bot.get_oauth_session_by_state", return_value=session), \
+             patch("bot.update_oauth_session_status", return_value={**session, "status": "expired"}) as update_status:
+            html = handle_spotify_callback(
+                state="state-abc",
+                code="code-123",
+                now_utc=datetime(2026, 3, 15, 12, 0, tzinfo=timezone.utc),
+            )
+
+        update_status.assert_called_once_with(7, "expired", expected_current_status="pending")
+        self.assertIn("Spotify state expired", html)
+
+    def test_handle_spotify_callback_marks_failed_when_code_missing(self) -> None:
+        session = {
+            "id": 7,
+            "status": "pending",
+            "expires_at": datetime(2026, 3, 15, 12, 30, tzinfo=timezone.utc),
+        }
+
+        with patch("bot.get_oauth_session_by_state", return_value=session), \
+             patch("bot.update_oauth_session_status", return_value={**session, "status": "failed"}) as update_status:
+            html = handle_spotify_callback(
+                state="state-abc",
+                code=None,
+                now_utc=datetime(2026, 3, 15, 12, 0, tzinfo=timezone.utc),
+            )
+
+        update_status.assert_called_once_with(7, "failed", expected_current_status="pending")
+        self.assertIn("Spotify callback incomplete", html)
 
 
 class RateLimitHelperTests(unittest.TestCase):
@@ -337,6 +432,42 @@ class CommandIdempotencyTests(unittest.IsolatedAsyncioTestCase):
             enqueue_job_once.call_args.kwargs["idempotency_key"],
             f"nextcycle:{user['id']}:{expected_request_id}",
         )
+
+
+class ConnectSpotifyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cmd_connect_spotify_creates_short_lived_oauth_session(self) -> None:
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=99),
+            effective_user=SimpleNamespace(id=42),
+            callback_query=None,
+            message=SimpleNamespace(reply_text=AsyncMock()),
+        )
+        context = SimpleNamespace(application=SimpleNamespace(bot_data={}))
+        user = {"id": 123}
+
+        with patch.dict(
+            os.environ,
+            {
+                "SPOTIFY_CLIENT_ID": "client-123",
+                "SPOTIFY_REDIRECT_URI": "https://example.com/oauth/spotify/callback",
+            },
+            clear=False,
+        ), \
+             patch("bot.require_allowlisted_user", AsyncMock(return_value=user)), \
+             patch("bot.generate_oauth_state", return_value="state-abc"), \
+             patch("bot.create_oauth_session", return_value={"id": 1}) as create_session, \
+             patch("bot.record_command"):
+            await cmd_connect_spotify(update, context)
+
+        create_session.assert_called_once()
+        self.assertEqual(create_session.call_args.kwargs["user_id"], 123)
+        self.assertEqual(create_session.call_args.kwargs["provider"], "spotify")
+        self.assertEqual(create_session.call_args.kwargs["state"], "state-abc")
+        self.assertEqual(create_session.call_args.kwargs["requested_chat_id"], 99)
+        update.message.reply_text.assert_awaited_once()
+        reply_text = update.message.reply_text.await_args.kwargs["text"]
+        self.assertIn("https://accounts.spotify.com/authorize", reply_text)
+        self.assertIn("state-abc", reply_text)
 
 
 class RateLimitTests(unittest.IsolatedAsyncioTestCase):

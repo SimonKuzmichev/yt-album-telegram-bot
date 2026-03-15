@@ -1,7 +1,10 @@
 import logging
 import os
+import secrets
 import threading
 from datetime import datetime, time as dt_time, timedelta, timezone
+from html import escape
+from urllib.parse import urlencode
 from uuid import NAMESPACE_URL, uuid4, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Any, Dict, Optional
@@ -27,13 +30,19 @@ from src.errors import is_auth_error, format_auth_help
 from src.logging_utils import configure_logging, log_event
 from src.metrics import record_command, record_rate_limit_hit, start_metrics_server
 from src.db import (
+    OAUTH_SESSION_STATUS_CONSUMED,
+    OAUTH_SESSION_STATUS_EXPIRED,
+    OAUTH_SESSION_STATUS_FAILED,
+    OAUTH_SESSION_STATUS_PENDING,
     PROVIDER_ACCOUNT_STATUS_CONNECTED,
     approve_user,
     block_user,
+    create_oauth_session,
     enqueue_job_once,
     ensure_user_settings,
     get_active_user_provider_account,
     get_admin_status_snapshot,
+    get_oauth_session_by_state,
     get_user_provider_sync_state,
     get_user_timezone_by_chat_id,
     get_user_delivery_stats,
@@ -43,6 +52,7 @@ from src.db import (
     set_active_user_provider_account,
     set_user_daily_time,
     set_user_timezone,
+    update_oauth_session_status,
     upsert_user,
 )
 from src.telegram_delivery import (
@@ -77,6 +87,8 @@ RATE_LIMIT_WINDOWS = {
     ),
 }
 logger = logging.getLogger(__name__)
+DEFAULT_SPOTIFY_SCOPE = "user-library-read"
+DEFAULT_OAUTH_STATE_TTL_SECONDS = 600
 
 
 class HTTPServerHandle:
@@ -97,10 +109,15 @@ def create_http_app() -> FastAPI:
         return "ok"
 
     @app.get("/oauth/spotify/callback", response_class=HTMLResponse)
-    async def spotify_callback(state: str | None = None, code: str | None = None) -> str:
-        return build_spotify_callback_html(
-            state_present=_query_param_present(state),
-            code_present=_query_param_present(code),
+    async def spotify_callback(
+        state: str | None = None,
+        code: str | None = None,
+        error: str | None = None,
+    ) -> str:
+        return handle_spotify_callback(
+            state=state,
+            code=code,
+            error=error,
         )
 
     return app
@@ -120,7 +137,13 @@ def start_http_server(host: str, port: int) -> HTTPServerHandle:
     return HTTPServerHandle(server, thread)
 
 
-def build_spotify_callback_html(*, state_present: bool, code_present: bool) -> str:
+def build_spotify_callback_html(
+    *,
+    title: str,
+    message: str,
+    state_present: bool,
+    code_present: bool,
+) -> str:
     state_value = "yes" if state_present else "no"
     code_value = "yes" if code_present else "no"
     return (
@@ -128,7 +151,8 @@ def build_spotify_callback_html(*, state_present: bool, code_present: bool) -> s
         "<html lang=\"en\">"
         "<head><meta charset=\"utf-8\"><title>Spotify Callback</title></head>"
         "<body>"
-        "<h1>Spotify callback reached</h1>"
+        f"<h1>{escape(title)}</h1>"
+        f"<p>{escape(message)}</p>"
         f"<p>state present: {state_value}</p>"
         f"<p>code present: {code_value}</p>"
         "</body>"
@@ -138,6 +162,134 @@ def build_spotify_callback_html(*, state_present: bool, code_present: bool) -> s
 
 def _query_param_present(value: str | None) -> bool:
     return value is not None and value != ""
+
+
+def generate_oauth_state() -> str:
+    return secrets.token_urlsafe(24)
+
+
+def get_spotify_oauth_state_ttl_seconds() -> int:
+    return get_env_int("SPOTIFY_OAUTH_STATE_TTL_SECONDS", DEFAULT_OAUTH_STATE_TTL_SECONDS)
+
+
+def build_spotify_authorize_url(*, client_id: str, redirect_uri: str, state: str) -> str:
+    query = urlencode(
+        {
+            "client_id": client_id,
+            "response_type": "code",
+            "redirect_uri": redirect_uri,
+            "scope": DEFAULT_SPOTIFY_SCOPE,
+            "state": state,
+        }
+    )
+    return f"https://accounts.spotify.com/authorize?{query}"
+
+
+def handle_spotify_callback(
+    *,
+    state: str | None,
+    code: str | None,
+    error: str | None = None,
+    now_utc: Optional[datetime] = None,
+) -> str:
+    state_present = _query_param_present(state)
+    code_present = _query_param_present(code)
+    current_time = now_utc or datetime.now(timezone.utc)
+
+    if not state_present:
+        return build_spotify_callback_html(
+            title="Invalid Spotify callback",
+            message="Missing state parameter.",
+            state_present=False,
+            code_present=code_present,
+        )
+
+    try:
+        session = get_oauth_session_by_state("spotify", str(state))
+    except Exception:
+        logger.exception("Failed to load OAuth session for Spotify callback")
+        return build_spotify_callback_html(
+            title="Spotify callback error",
+            message="Could not validate the connection request.",
+            state_present=True,
+            code_present=code_present,
+        )
+
+    if session is None:
+        return build_spotify_callback_html(
+            title="Unknown Spotify state",
+            message="This connection request is invalid or has already been cleared.",
+            state_present=True,
+            code_present=code_present,
+        )
+
+    if str(session.get("status") or "") != OAUTH_SESSION_STATUS_PENDING:
+        return build_spotify_callback_html(
+            title="Spotify state already used",
+            message="This connection request is no longer active.",
+            state_present=True,
+            code_present=code_present,
+        )
+
+    expires_at = session.get("expires_at")
+    if isinstance(expires_at, datetime) and expires_at <= current_time:
+        update_oauth_session_status(
+            int(session["id"]),
+            OAUTH_SESSION_STATUS_EXPIRED,
+            expected_current_status=OAUTH_SESSION_STATUS_PENDING,
+        )
+        return build_spotify_callback_html(
+            title="Spotify state expired",
+            message="This connection request expired. Start /connect_spotify again in Telegram.",
+            state_present=True,
+            code_present=code_present,
+        )
+
+    if _query_param_present(error):
+        update_oauth_session_status(
+            int(session["id"]),
+            OAUTH_SESSION_STATUS_FAILED,
+            expected_current_status=OAUTH_SESSION_STATUS_PENDING,
+        )
+        return build_spotify_callback_html(
+            title="Spotify authorization failed",
+            message="Spotify returned an authorization error. Start /connect_spotify again in Telegram.",
+            state_present=True,
+            code_present=code_present,
+        )
+
+    if not code_present:
+        update_oauth_session_status(
+            int(session["id"]),
+            OAUTH_SESSION_STATUS_FAILED,
+            expected_current_status=OAUTH_SESSION_STATUS_PENDING,
+        )
+        return build_spotify_callback_html(
+            title="Spotify callback incomplete",
+            message="Missing authorization code. Start /connect_spotify again in Telegram.",
+            state_present=True,
+            code_present=False,
+        )
+
+    updated_session = update_oauth_session_status(
+        int(session["id"]),
+        OAUTH_SESSION_STATUS_CONSUMED,
+        expected_current_status=OAUTH_SESSION_STATUS_PENDING,
+    )
+    if updated_session is None:
+        return build_spotify_callback_html(
+            title="Spotify state already used",
+            message="This connection request is no longer active.",
+            state_present=True,
+            code_present=True,
+        )
+
+    return build_spotify_callback_html(
+        title="Spotify authorization received",
+        message="Spotify returned successfully. You can go back to Telegram.",
+        state_present=True,
+        code_present=True,
+    )
 
 
 def _log_bot_event(
@@ -1147,7 +1299,51 @@ async def cmd_connect_spotify(update: Update, context: ContextTypes.DEFAULT_TYPE
         if user is None:
             status = "rejected"
             return
-        await reply(update, context, "Spotify connection is not implemented yet.")
+        chat_id = get_update_chat_id(update)
+        if chat_id is None:
+            status = "rejected"
+            return
+
+        client_id = os.getenv("SPOTIFY_CLIENT_ID", "").strip()
+        redirect_uri = os.getenv("SPOTIFY_REDIRECT_URI", "").strip()
+        if not client_id or not redirect_uri:
+            await reply(
+                update,
+                context,
+                "Spotify OAuth is not configured yet. Set SPOTIFY_CLIENT_ID and SPOTIFY_REDIRECT_URI.",
+            )
+            status = "rejected"
+            return
+
+        state = generate_oauth_state()
+        expires_at = datetime.now(timezone.utc) + timedelta(seconds=get_spotify_oauth_state_ttl_seconds())
+        try:
+            create_oauth_session(
+                user_id=int(user["id"]),
+                provider="spotify",
+                state=state,
+                requested_chat_id=chat_id,
+                expires_at=expires_at,
+            )
+        except Exception as e:
+            await notify_error(context, chat_id, "Failed to start Spotify OAuth", e)
+            status = "error"
+            return
+
+        authorize_url = build_spotify_authorize_url(
+            client_id=client_id,
+            redirect_uri=redirect_uri,
+            state=state,
+        )
+        await reply(
+            update,
+            context,
+            (
+                "Open this link to connect Spotify:\n"
+                f"{authorize_url}\n\n"
+                "This link is single-use and expires soon."
+            ),
+        )
         status = "success"
     finally:
         record_command("connect_spotify", status)

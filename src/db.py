@@ -15,6 +15,7 @@ from src.credentials_encryption import decrypt_for_runtime, encrypt_for_storage
 UserRow = Dict[str, Any]
 JobRow = Dict[str, Any]
 ProviderAccountRow = Dict[str, Any]
+OAuthSessionRow = Dict[str, Any]
 logger = logging.getLogger(__name__)
 
 PROVIDER_ACCOUNT_STATUS_PENDING = "pending"
@@ -26,6 +27,11 @@ SYNC_RESULT_OK = "ok"
 SYNC_RESULT_TRANSIENT_ERROR = "transient_error"
 SYNC_RESULT_AUTH_ERROR = "auth_error"
 SYNC_RESULT_EMPTY_LIBRARY = "empty_library"
+
+OAUTH_SESSION_STATUS_PENDING = "pending"
+OAUTH_SESSION_STATUS_CONSUMED = "consumed"
+OAUTH_SESSION_STATUS_EXPIRED = "expired"
+OAUTH_SESSION_STATUS_FAILED = "failed"
 
 
 def get_database_url() -> str:
@@ -254,6 +260,203 @@ def get_user_timezone_by_chat_id(telegram_chat_id: int) -> Optional[str]:
         return timezone_name
     except Exception:
         logger.exception("DB get_user_timezone_by_chat_id failed telegram_chat_id=%s", telegram_chat_id)
+        raise
+
+
+def create_oauth_session(
+    *,
+    user_id: int,
+    provider: str,
+    state: str,
+    expires_at: datetime,
+    requested_chat_id: Optional[int] = None,
+    code_verifier: Optional[str] = None,
+) -> OAuthSessionRow:
+    logger.debug(
+        "DB create_oauth_session started user_id=%s provider=%s requested_chat_id=%s",
+        user_id,
+        provider,
+        requested_chat_id,
+    )
+    normalized_provider = provider.strip().lower()
+    try:
+        with open_db_connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO app.oauth_sessions (
+                            user_id,
+                            provider,
+                            state,
+                            code_verifier,
+                            status,
+                            requested_chat_id,
+                            expires_at
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        RETURNING
+                            id,
+                            user_id,
+                            provider,
+                            state,
+                            code_verifier,
+                            status,
+                            requested_chat_id,
+                            created_at,
+                            expires_at,
+                            consumed_at
+                        """,
+                        (
+                            user_id,
+                            normalized_provider,
+                            state,
+                            code_verifier,
+                            OAUTH_SESSION_STATUS_PENDING,
+                            requested_chat_id,
+                            expires_at,
+                        ),
+                    )
+                    row = cur.fetchone()
+        if row is None:
+            raise RuntimeError("Failed to create OAuth session")
+        logger.debug(
+            "DB create_oauth_session done session_id=%s user_id=%s provider=%s",
+            row.get("id"),
+            user_id,
+            normalized_provider,
+        )
+        return row
+    except Exception:
+        logger.exception(
+            "DB create_oauth_session failed user_id=%s provider=%s",
+            user_id,
+            normalized_provider,
+        )
+        raise
+
+
+def get_oauth_session_by_state(provider: str, state: str) -> Optional[OAuthSessionRow]:
+    logger.debug("DB get_oauth_session_by_state started provider=%s", provider)
+    normalized_provider = provider.strip().lower()
+    try:
+        with open_db_connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT
+                            id,
+                            user_id,
+                            provider,
+                            state,
+                            code_verifier,
+                            status,
+                            requested_chat_id,
+                            created_at,
+                            expires_at,
+                            consumed_at
+                        FROM app.oauth_sessions
+                        WHERE provider = %s
+                          AND state = %s
+                        LIMIT 1
+                        """,
+                        (normalized_provider, state),
+                    )
+                    row = cur.fetchone()
+        logger.debug(
+            "DB get_oauth_session_by_state done provider=%s found=%s",
+            normalized_provider,
+            row is not None,
+        )
+        return row
+    except Exception:
+        logger.exception("DB get_oauth_session_by_state failed provider=%s", normalized_provider)
+        raise
+
+
+def update_oauth_session_status(
+    session_id: int,
+    status: str,
+    *,
+    expected_current_status: Optional[str] = None,
+) -> Optional[OAuthSessionRow]:
+    logger.debug(
+        "DB update_oauth_session_status started session_id=%s status=%s expected_current_status=%s",
+        session_id,
+        status,
+        expected_current_status,
+    )
+    try:
+        with open_db_connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    if expected_current_status is None:
+                        cur.execute(
+                            """
+                            UPDATE app.oauth_sessions
+                            SET
+                                status = %s,
+                                consumed_at = CASE
+                                    WHEN %s = %s THEN consumed_at
+                                    ELSE NOW()
+                                END
+                            WHERE id = %s
+                            RETURNING
+                                id,
+                                user_id,
+                                provider,
+                                state,
+                                code_verifier,
+                                status,
+                                requested_chat_id,
+                                created_at,
+                                expires_at,
+                                consumed_at
+                            """,
+                            (status, status, OAUTH_SESSION_STATUS_PENDING, session_id),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            UPDATE app.oauth_sessions
+                            SET
+                                status = %s,
+                                consumed_at = CASE
+                                    WHEN %s = %s THEN consumed_at
+                                    ELSE NOW()
+                                END
+                            WHERE id = %s
+                              AND status = %s
+                            RETURNING
+                                id,
+                                user_id,
+                                provider,
+                                state,
+                                code_verifier,
+                                status,
+                                requested_chat_id,
+                                created_at,
+                                expires_at,
+                                consumed_at
+                            """,
+                            (
+                                status,
+                                status,
+                                OAUTH_SESSION_STATUS_PENDING,
+                                session_id,
+                                expected_current_status,
+                            ),
+                        )
+                    row = cur.fetchone()
+        logger.debug(
+            "DB update_oauth_session_status done session_id=%s updated=%s",
+            session_id,
+            row is not None,
+        )
+        return row
+    except Exception:
+        logger.exception("DB update_oauth_session_status failed session_id=%s", session_id)
         raise
 
 

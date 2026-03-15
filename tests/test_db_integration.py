@@ -93,6 +93,7 @@ class PostgresIntegrationTestCase(unittest.TestCase):
                     cur.execute(
                         """
                         TRUNCATE TABLE
+                            app.oauth_sessions,
                             app.user_library_albums,
                             app.user_provider_sync_state,
                             app.user_provider_accounts,
@@ -448,6 +449,64 @@ class ProviderAccountIntegrationTests(PostgresIntegrationTestCase):
         rows = db.list_provider_accounts_due_for_sync(sync_before=sync_before)
 
         self.assertEqual([int(row["id"]) for row in rows], [int(connected["id"])])
+
+
+class OAuthSessionIntegrationTests(PostgresIntegrationTestCase):
+    def test_create_oauth_session_persists_user_binding_and_expiry(self) -> None:
+        user_id = self.create_user(telegram_user_id=1900, telegram_chat_id=2900, username="oauth_user")
+        expires_at = datetime.now(timezone.utc) + timedelta(minutes=10)
+
+        session = db.create_oauth_session(
+            user_id=user_id,
+            provider="spotify",
+            state="state-abc",
+            requested_chat_id=2900,
+            expires_at=expires_at,
+        )
+
+        row = self.query_one(
+            """
+            SELECT user_id, provider, state, status, requested_chat_id, expires_at, consumed_at
+            FROM app.oauth_sessions
+            WHERE id = %s
+            """,
+            (session["id"],),
+        )
+
+        self.assertEqual(row["user_id"], user_id)
+        self.assertEqual(row["provider"], "spotify")
+        self.assertEqual(row["state"], "state-abc")
+        self.assertEqual(row["status"], "pending")
+        self.assertEqual(row["requested_chat_id"], 2900)
+        self.assertEqual(row["expires_at"], expires_at)
+        self.assertIsNone(row["consumed_at"])
+
+    def test_update_oauth_session_status_enforces_expected_current_status(self) -> None:
+        user_id = self.create_user(telegram_user_id=1901, telegram_chat_id=2901, username="oauth_status")
+        session = db.create_oauth_session(
+            user_id=user_id,
+            provider="spotify",
+            state="state-def",
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+        )
+
+        consumed = db.update_oauth_session_status(
+            int(session["id"]),
+            db.OAUTH_SESSION_STATUS_CONSUMED,
+            expected_current_status=db.OAUTH_SESSION_STATUS_PENDING,
+        )
+        second_update = db.update_oauth_session_status(
+            int(session["id"]),
+            db.OAUTH_SESSION_STATUS_FAILED,
+            expected_current_status=db.OAUTH_SESSION_STATUS_PENDING,
+        )
+        reloaded = db.get_oauth_session_by_state("spotify", "state-def")
+
+        self.assertIsNotNone(consumed)
+        self.assertEqual(consumed["status"], "consumed")
+        self.assertIsNone(second_update)
+        self.assertEqual(reloaded["status"], "consumed")
+        self.assertIsNotNone(reloaded["consumed_at"])
 
 
 if __name__ == "__main__":
