@@ -58,6 +58,7 @@ Notes:
 
 - `DATABASE_URL` is required by both `bot.py` and `worker.py`.
 - `REDIS_URL` is required by `bot.py` for command locks, request dedupe, and rate limiting.
+- `CONTAINER_DATABASE_URL` and `CONTAINER_REDIS_URL` are optional Compose-specific overrides. They default to the built-in `db` and `redis` service addresses.
 - `ALLOWED_CHAT_ID` is only an admin override for admin-only commands such as `/approve`, `/block`, and `/admin_status`.
 - Daily scheduling is executed by `worker.py` using per-user settings stored in the DB.
 - `/refresh` now queues a sync for the calling user’s active provider account.
@@ -99,10 +100,22 @@ pip install -r requirements.txt
 python3 worker.py
 ```
 
+To run the full app stack with Compose instead:
+
+```bash
+docker compose up -d --build bot-app worker
+```
+
 To start the optional monitoring stack locally:
 
 ```bash
 docker compose up -d prometheus grafana
+```
+
+For a release-style rollout that rebuilds the app containers, runs migrations, and restarts the Compose services:
+
+```bash
+./scripts/release.sh
 ```
 
 ## Getting `ALLOWED_CHAT_ID`

@@ -6,14 +6,14 @@ scrape_configs:
   - job_name: "daily_yt_album_bot_bot"
     static_configs:
       - targets:
-          - "host.docker.internal:8000"
+          - "bot-app:8000"
         labels:
           app: "daily_yt_album_bot"
           component: "bot"
   - job_name: "daily_yt_album_bot_worker"
     static_configs:
       - targets:
-          - "host.docker.internal:8001"
+          - "worker:8001"
         labels:
           app: "daily_yt_album_bot"
           component: "worker"
