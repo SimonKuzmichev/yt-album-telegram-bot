@@ -410,6 +410,49 @@ class ProviderAccountIntegrationTests(PostgresIntegrationTestCase):
         self.assertFalse(inactive_row["is_active"])
         self.assertEqual(count_row["cnt"], 2)
 
+    def test_set_active_user_provider_account_switches_without_unique_violation(self) -> None:
+        user_id = self.create_user(telegram_user_id=1601, telegram_chat_id=2601, username="provider_switch")
+
+        first = db.upsert_user_provider_account_credentials(
+            user_id=user_id,
+            provider="ytmusic",
+            credentials={"cookie_blob": "yt"},
+            is_active=True,
+        )
+        second = db.upsert_user_provider_account_credentials(
+            user_id=user_id,
+            provider="spotify",
+            credentials={"refresh_token": "sp"},
+            is_active=False,
+        )
+
+        switched = db.set_active_user_provider_account(user_id, "spotify")
+        active = db.get_active_user_provider_account(user_id)
+        active_count = self.query_one(
+            """
+            SELECT COUNT(*)::INT AS cnt
+            FROM app.user_provider_accounts
+            WHERE user_id = %s
+              AND is_active = TRUE
+            """,
+            (user_id,),
+        )
+        first_state = self.query_one(
+            """
+            SELECT is_active
+            FROM app.user_provider_accounts
+            WHERE id = %s
+            """,
+            (first["id"],),
+        )
+
+        self.assertIsNotNone(switched)
+        self.assertEqual(switched["id"], second["id"])
+        self.assertIsNotNone(active)
+        self.assertEqual(active["id"], second["id"])
+        self.assertEqual(active_count["cnt"], 1)
+        self.assertFalse(first_state["is_active"])
+
     def test_sync_state_tracks_explicit_result_statuses(self) -> None:
         user_id = self.create_user(telegram_user_id=1700, telegram_chat_id=2700, username="sync_state")
         account = db.upsert_user_provider_account_credentials(

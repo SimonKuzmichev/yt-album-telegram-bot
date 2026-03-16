@@ -1409,11 +1409,25 @@ def set_active_user_provider_account(user_id: int, provider: str) -> Optional[Pr
                         """
                         UPDATE app.user_provider_accounts
                         SET
-                            is_active = CASE WHEN provider = %s THEN TRUE ELSE FALSE END,
+                            is_active = FALSE,
                             updated_at = NOW()
                         WHERE user_id = %s
+                          AND provider <> %s
+                          AND is_active = TRUE
                         """,
-                        (normalized_provider, user_id),
+                        (user_id, normalized_provider),
+                    )
+
+                    cur.execute(
+                        """
+                        UPDATE app.user_provider_accounts
+                        SET
+                            is_active = TRUE,
+                            updated_at = NOW()
+                        WHERE user_id = %s
+                          AND provider = %s
+                        """,
+                        (user_id, normalized_provider),
                     )
 
                     cur.execute(
