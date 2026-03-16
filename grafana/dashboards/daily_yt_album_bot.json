@@ -229,7 +229,7 @@
       },
       "targets": [
         {
-          "expr": "sum(provider_accounts_needs_reauth)",
+          "expr": "sum(provider_accounts_needing_reauth)",
           "legendFormat": "needs_reauth",
           "refId": "A"
         }

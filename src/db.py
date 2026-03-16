@@ -31,6 +31,7 @@ SYNC_RESULT_AUTH_ERROR = "auth_error"
 SYNC_RESULT_EMPTY_LIBRARY = "empty_library"
 
 OAUTH_SESSION_STATUS_PENDING = "pending"
+OAUTH_SESSION_STATUS_PROCESSING = "processing"
 OAUTH_SESSION_STATUS_CONSUMED = "consumed"
 OAUTH_SESSION_STATUS_EXPIRED = "expired"
 OAUTH_SESSION_STATUS_FAILED = "failed"
@@ -52,6 +53,7 @@ def _upsert_user_tx(
     telegram_user_id: int,
     telegram_chat_id: int,
     username: Optional[str],
+    update_chat_id: bool,
 ) -> UserRow:
     with conn.cursor() as cur:
         cur.execute(
@@ -64,14 +66,16 @@ def _upsert_user_tx(
             VALUES (%s, %s, %s)
             ON CONFLICT (telegram_user_id)
             DO UPDATE SET
-                telegram_chat_id = EXCLUDED.telegram_chat_id,
+                telegram_chat_id = CASE
+                    WHEN %s THEN EXCLUDED.telegram_chat_id
+                    ELSE app.users.telegram_chat_id
+                END,
                 username = EXCLUDED.username,
                 updated_at = NOW()
             RETURNING id, allowlisted, status
             """,
-            (telegram_user_id, telegram_chat_id, username),
+            (telegram_user_id, telegram_chat_id, username, update_chat_id),
         )
-        #TODO: check the return later
         row = cur.fetchone()
         if row is None:
             raise RuntimeError("Failed to upsert user")
@@ -100,7 +104,13 @@ def _set_user_access_tx(
         return cur.fetchone()
 
 
-def upsert_user(telegram_user_id: int, telegram_chat_id: int, username: Optional[str] = None) -> UserRow:
+def upsert_user(
+    telegram_user_id: int,
+    telegram_chat_id: int,
+    username: Optional[str] = None,
+    *,
+    update_chat_id: bool = True,
+) -> UserRow:
     logger.debug(
         "DB upsert_user started telegram_user_id=%s telegram_chat_id=%s",
         telegram_user_id,
@@ -114,6 +124,7 @@ def upsert_user(telegram_user_id: int, telegram_chat_id: int, username: Optional
                     telegram_user_id=telegram_user_id,
                     telegram_chat_id=telegram_chat_id,
                     username=username,
+                    update_chat_id=update_chat_id,
                 )
         logger.debug(
             "DB upsert_user done user_id=%s allowlisted=%s status=%s",
@@ -462,6 +473,58 @@ def update_oauth_session_status(
         raise
 
 
+def claim_oauth_session_by_state(
+    provider: str,
+    state: str,
+    *,
+    now_utc: datetime,
+) -> Optional[OAuthSessionRow]:
+    logger.debug("DB claim_oauth_session_by_state started provider=%s", provider)
+    normalized_provider = provider.strip().lower()
+    try:
+        with open_db_connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE app.oauth_sessions
+                        SET status = %s
+                        WHERE provider = %s
+                          AND state = %s
+                          AND status = %s
+                          AND expires_at > %s
+                        RETURNING
+                            id,
+                            user_id,
+                            provider,
+                            state,
+                            code_verifier,
+                            status,
+                            requested_chat_id,
+                            created_at,
+                            expires_at,
+                            consumed_at
+                        """,
+                        (
+                            OAUTH_SESSION_STATUS_PROCESSING,
+                            normalized_provider,
+                            state,
+                            OAUTH_SESSION_STATUS_PENDING,
+                            now_utc,
+                        ),
+                    )
+                    row = cur.fetchone()
+        logger.debug(
+            "DB claim_oauth_session_by_state done provider=%s claimed=%s",
+            normalized_provider,
+            row is not None,
+        )
+        return row
+    except Exception:
+        logger.exception("DB claim_oauth_session_by_state failed provider=%s", normalized_provider)
+        raise
+
+
 def set_user_timezone(user_id: int, timezone: str) -> UserRow:
     logger.debug("DB set_user_timezone started user_id=%s timezone=%s", user_id, timezone)
     try:
@@ -574,13 +637,16 @@ def list_active_users_with_delivery_context() -> List[UserRow]:
                             pa.status AS provider_status
                         FROM app.users AS u
                         JOIN app.user_settings AS s ON s.user_id = u.id
-                        LEFT JOIN app.user_provider_accounts AS pa
+                        JOIN app.user_provider_accounts AS pa
                           ON pa.user_id = u.id
                          AND pa.is_active = TRUE
+                         AND pa.status = %s
                         WHERE u.allowlisted = TRUE
                           AND u.status = 'active'
                         ORDER BY u.id ASC
                         """
+                        ,
+                        (PROVIDER_ACCOUNT_STATUS_CONNECTED,),
                     )
                     rows = cur.fetchall()
         logger.debug("DB list_active_users_with_delivery_context done count=%s", len(rows))
@@ -819,7 +885,13 @@ def mark_job_succeeded(job_id: UUID, idempotency_key: Optional[str] = None) -> N
         raise
 
 
-def mark_job_failed(job_id: UUID, error_text: str, next_run_at: datetime) -> JobRow:
+def mark_job_failed(
+    job_id: UUID,
+    error_text: str,
+    next_run_at: datetime,
+    *,
+    retryable: bool = True,
+) -> JobRow:
     logger.debug("DB mark_job_failed started job_id=%s", job_id)
     try:
         with open_db_connection() as conn:
@@ -831,10 +903,12 @@ def mark_job_failed(job_id: UUID, error_text: str, next_run_at: datetime) -> Job
                         SET
                             attempt = attempt + 1,
                             status = CASE
+                                WHEN NOT %s THEN 'dead'
                                 WHEN (attempt + 1) >= max_attempts THEN 'dead'
                                 ELSE 'queued'
                             END,
                             run_at = CASE
+                                WHEN NOT %s THEN run_at
                                 WHEN (attempt + 1) >= max_attempts THEN run_at
                                 ELSE %s
                             END,
@@ -845,7 +919,7 @@ def mark_job_failed(job_id: UUID, error_text: str, next_run_at: datetime) -> Job
                         WHERE id = %s
                         RETURNING id, status, attempt, max_attempts, run_at
                         """,
-                        (next_run_at, error_text[:1000], job_id),
+                        (retryable, retryable, next_run_at, error_text[:1000], job_id),
                     )
                     row = cur.fetchone()
         if row is None:
@@ -895,6 +969,43 @@ def insert_delivery_history(user_id: int, cycle_number: int, album_id: str) -> b
     except Exception:
         logger.exception(
             "DB insert_delivery_history failed user_id=%s cycle_number=%s",
+            user_id,
+            cycle_number,
+        )
+        raise
+
+
+def delete_delivery_history(user_id: int, cycle_number: int, album_id: str) -> int:
+    logger.debug(
+        "DB delete_delivery_history started user_id=%s cycle_number=%s album_id=%s",
+        user_id,
+        cycle_number,
+        album_id,
+    )
+    try:
+        with open_db_connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        DELETE FROM app.delivery_history
+                        WHERE user_id = %s
+                          AND cycle_number = %s
+                          AND album_id = %s
+                        """,
+                        (user_id, cycle_number, album_id),
+                    )
+                    deleted = cur.rowcount
+        logger.debug(
+            "DB delete_delivery_history done user_id=%s cycle_number=%s deleted=%s",
+            user_id,
+            cycle_number,
+            deleted,
+        )
+        return deleted
+    except Exception:
+        logger.exception(
+            "DB delete_delivery_history failed user_id=%s cycle_number=%s",
             user_id,
             cycle_number,
         )
@@ -1397,9 +1508,10 @@ def set_active_user_provider_account(user_id: int, provider: str) -> Optional[Pr
                         FROM app.user_provider_accounts
                         WHERE user_id = %s
                           AND provider = %s
+                          AND status = %s
                         LIMIT 1
                         """,
-                        (user_id, normalized_provider),
+                        (user_id, normalized_provider, PROVIDER_ACCOUNT_STATUS_CONNECTED),
                     )
                     existing = cur.fetchone()
                     if existing is None:

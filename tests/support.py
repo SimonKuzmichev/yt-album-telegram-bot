@@ -76,6 +76,7 @@ def install_module_stubs() -> None:
         db.OAUTH_SESSION_STATUS_EXPIRED = "expired"
         db.OAUTH_SESSION_STATUS_FAILED = "failed"
         db.OAUTH_SESSION_STATUS_PENDING = "pending"
+        db.OAUTH_SESSION_STATUS_PROCESSING = "processing"
         db.PROVIDER_ACCOUNT_STATUS_CONNECTED = "connected"
         db.PROVIDER_ACCOUNT_STATUS_DISABLED = "disabled"
         db.PROVIDER_ACCOUNT_STATUS_NOT_CONNECTED = "not_connected"
@@ -90,7 +91,9 @@ def install_module_stubs() -> None:
             "approve_user",
             "block_user",
             "claim_runnable_jobs",
+            "claim_oauth_session_by_state",
             "create_oauth_session",
+            "delete_delivery_history",
             "disable_user_provider_account",
             "enqueue_job_once",
             "ensure_user_settings",

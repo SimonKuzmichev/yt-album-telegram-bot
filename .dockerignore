@@ -3,10 +3,12 @@
 .pytest_cache
 .ruff_cache
 .venv
+.env
+secrets/
+data/
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 *.sqlite3
 tests/
-

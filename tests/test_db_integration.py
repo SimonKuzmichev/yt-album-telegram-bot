@@ -147,6 +147,33 @@ class UserIntegrationTests(PostgresIntegrationTestCase):
         self.assertFalse(row["allowlisted"])
         self.assertEqual(row["status"], "pending")
 
+    def test_group_registration_does_not_replace_existing_delivery_chat_id(self) -> None:
+        first = db.upsert_user(
+            telegram_user_id=1002,
+            telegram_chat_id=2002,
+            username="private-chat",
+            update_chat_id=True,
+        )
+        second = db.upsert_user(
+            telegram_user_id=1002,
+            telegram_chat_id=-10012345,
+            username="group-chat",
+            update_chat_id=False,
+        )
+
+        row = self.query_one(
+            """
+            SELECT telegram_chat_id, username
+            FROM app.users
+            WHERE telegram_user_id = %s
+            """,
+            (1002,),
+        )
+
+        self.assertEqual(first["id"], second["id"])
+        self.assertEqual(row["telegram_chat_id"], 2002)
+        self.assertEqual(row["username"], "group-chat")
+
     def test_schedule_storage_is_per_user(self) -> None:
         user_a = self.create_user(telegram_user_id=1010, telegram_chat_id=2010, username="alpha")
         user_b = self.create_user(telegram_user_id=1020, telegram_chat_id=2020, username="beta")
@@ -171,6 +198,13 @@ class JobIntegrationTests(PostgresIntegrationTestCase):
         db.approve_user(1100)
         db.set_user_timezone(user_id, "Asia/Tokyo")
         db.set_user_daily_time(user_id, dt_time(9, 0))
+        db.upsert_user_provider_account_credentials(
+            user_id=user_id,
+            provider="ytmusic",
+            credentials={"cookie_blob": "yt-cookie"},
+            status="connected",
+            is_active=True,
+        )
 
         fixed_now = datetime(2026, 3, 9, 23, 59, tzinfo=timezone.utc)
 
@@ -317,6 +351,34 @@ class JobIntegrationTests(PostgresIntegrationTestCase):
         self.assertIsNone(row["locked_by"])
         self.assertIsNone(row["locked_at"])
 
+    def test_non_retryable_failure_marks_job_dead_immediately(self) -> None:
+        user_id = self.create_user(telegram_user_id=1301, telegram_chat_id=2301, username="no-retry")
+        job = db.enqueue_job(
+            job_id=uuid4(),
+            user_id=user_id,
+            job_type="deliver_now",
+            run_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+            payload={"telegram_chat_id": 2301},
+        )
+        db.claim_runnable_jobs(worker_id="worker-a", batch_size=10)
+
+        state = db.mark_job_failed(
+            job_id=job["id"],
+            error_text="401 unauthorized",
+            next_run_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+            retryable=False,
+        )
+        row = self.query_one(
+            "SELECT attempt, status, locked_by, locked_at FROM app.jobs WHERE id = %s",
+            (job["id"],),
+        )
+
+        self.assertEqual(state["status"], "dead")
+        self.assertEqual(row["attempt"], 1)
+        self.assertEqual(row["status"], "dead")
+        self.assertIsNone(row["locked_by"])
+        self.assertIsNone(row["locked_at"])
+
 
 class DeliveryHistoryIntegrationTests(PostgresIntegrationTestCase):
     def test_inserting_delivery_history_prevents_duplicate_album_in_same_cycle(self) -> None:
@@ -452,6 +514,30 @@ class ProviderAccountIntegrationTests(PostgresIntegrationTestCase):
         self.assertEqual(active["id"], second["id"])
         self.assertEqual(active_count["cnt"], 1)
         self.assertFalse(first_state["is_active"])
+
+    def test_set_active_user_provider_account_rejects_non_connected_account(self) -> None:
+        user_id = self.create_user(telegram_user_id=1602, telegram_chat_id=2602, username="blocked_switch")
+
+        db.upsert_user_provider_account_credentials(
+            user_id=user_id,
+            provider="ytmusic",
+            credentials={"cookie_blob": "yt"},
+            is_active=True,
+        )
+        db.upsert_user_provider_account_credentials(
+            user_id=user_id,
+            provider="spotify",
+            credentials={"refresh_token": "sp"},
+            status="needs_reauth",
+            is_active=False,
+        )
+
+        switched = db.set_active_user_provider_account(user_id, "spotify")
+        active = db.get_active_user_provider_account(user_id)
+
+        self.assertIsNone(switched)
+        self.assertIsNotNone(active)
+        self.assertEqual(active["provider"], "ytmusic")
 
     def test_sync_state_tracks_explicit_result_statuses(self) -> None:
         user_id = self.create_user(telegram_user_id=1700, telegram_chat_id=2700, username="sync_state")

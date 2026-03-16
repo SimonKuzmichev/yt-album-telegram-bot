@@ -81,11 +81,6 @@ provider_accounts_total = Gauge(
     "Provider account totals by provider and status.",
     ["provider", "status"],
 )
-provider_accounts_needs_reauth = Gauge(
-    "provider_accounts_needs_reauth",
-    "Provider accounts needing reauth by provider.",
-    ["provider"],
-)
 provider_accounts_needing_reauth = Gauge(
     "provider_accounts_needing_reauth",
     "Provider accounts needing reauth by provider.",
@@ -215,7 +210,6 @@ def record_oauth_state_validation_failure(provider: str) -> None:
 
 def update_runtime_snapshot(snapshot: dict[str, list[dict[str, Any]]]) -> None:
     provider_accounts_total.clear()
-    provider_accounts_needs_reauth.clear()
     provider_accounts_needing_reauth.clear()
     provider_library_album_count.clear()
     job_queue_depth.clear()
@@ -227,9 +221,6 @@ def update_runtime_snapshot(snapshot: dict[str, list[dict[str, Any]]]) -> None:
         ).set(int(row.get("count") or 0))
 
     for row in snapshot.get("provider_needs_reauth", []):
-        provider_accounts_needs_reauth.labels(
-            provider=normalize_provider(row.get("provider")),
-        ).set(int(row.get("count") or 0))
         provider_accounts_needing_reauth.labels(
             provider=normalize_provider(row.get("provider")),
         ).set(int(row.get("count") or 0))

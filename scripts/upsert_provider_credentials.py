@@ -18,7 +18,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--status",
         default="connected",
-        help="Provider account status to store: pending, connected, needs_reauth, or disabled",
+        help="Provider account status to store: pending_oauth, connected, token_expired, needs_reauth, or disabled",
     )
     parser.add_argument(
         "--inactive",

@@ -157,12 +157,18 @@ def test_provider_selection_rules_and_status_transitions(integration_modules, te
     assert active is not None
     assert active["provider"] == "ytmusic"
 
-    db.set_active_user_provider_account(user_id, "spotify")
+    switched = db.set_active_user_provider_account(user_id, "spotify")
     active = db.get_active_user_provider_account(user_id)
+    assert switched is None
     assert active is not None
-    assert active["provider"] == "spotify"
+    assert active["provider"] == "ytmusic"
 
     db.mark_user_provider_account_status(int(spotify_account["id"]), "connected")
+    switched = db.set_active_user_provider_account(user_id, "spotify")
+    active = db.get_active_user_provider_account(user_id)
+    assert switched is not None
+    assert active is not None
+    assert active["provider"] == "spotify"
     db.mark_user_provider_sync_started(int(spotify_account["id"]))
     db.mark_user_provider_sync_failed(int(spotify_account["id"]), "401 unauthorized", result_status="auth_error")
 

@@ -1,3 +1,4 @@
+import asyncio
 import os
 import unittest
 from datetime import datetime, time as dt_time, timezone
@@ -17,6 +18,7 @@ from worker import (  # noqa: E402
     _is_due_now,
     _local_date_key,
     _sync_log_fields,
+    enqueue_due_jobs,
     enqueue_due_token_refresh_jobs,
     _sync_provider_account,
 )
@@ -268,6 +270,27 @@ class TokenRefreshEnqueueTests(unittest.TestCase):
             "refresh-token:55:1773576300",
         )
 
+    def test_daily_enqueue_skips_users_without_connected_provider(self) -> None:
+        cfg = SimpleNamespace(worker_id="worker-1", due_window_seconds=60)
+        users = [
+            {
+                "user_id": 88,
+                "telegram_chat_id": 99,
+                "timezone": "UTC",
+                "daily_time_local": dt_time(9, 0),
+                "active_provider": None,
+                "provider_status": None,
+            }
+        ]
+
+        with patch.object(worker, "list_active_users_with_delivery_context", return_value=users), \
+             patch.object(worker, "enqueue_job_once") as enqueue_job_once, \
+             patch.object(worker, "log_event"):
+            enqueued = enqueue_due_jobs(cfg)
+
+        self.assertEqual(enqueued, 0)
+        enqueue_job_once.assert_not_called()
+
     def test_logs_structured_sync_failure_fields(self) -> None:
         cfg = SimpleNamespace(library_limit=10)
         account = {"id": 55, "provider": "ytmusic", "status": "connected"}
@@ -337,6 +360,63 @@ class DeliveryAlbumSelectionTests(unittest.TestCase):
         with patch.object(worker, "get_active_user_provider_account", return_value=None):
             with self.assertRaises(RuntimeError):
                 _get_delivery_albums(cfg, user_id=8)
+
+    def test_delivery_failure_releases_reserved_album(self) -> None:
+        cfg = SimpleNamespace(library_limit=10)
+        job = {
+            "id": "job-1",
+            "user_id": 7,
+            "job_type": worker.JOB_TYPE_DELIVER_NOW,
+            "payload": {"telegram_chat_id": 99},
+        }
+        album = {"provider_album_id": "album-1", "title": "Discovery"}
+
+        async def failing_send(*args, **kwargs):
+            raise RuntimeError("telegram send failed")
+
+        with patch.object(worker, "get_active_user_provider_account", return_value={"id": 55, "provider": "ytmusic"}), \
+             patch.object(worker, "_get_delivery_albums", return_value=[album]), \
+             patch.object(worker, "get_latest_cycle_number", return_value=1), \
+             patch.object(worker, "list_cycle_album_ids", return_value=[]), \
+             patch.object(worker, "insert_delivery_history", return_value=True), \
+             patch.object(worker, "delete_delivery_history") as delete_delivery_history, \
+             patch.object(worker.random, "choice", return_value=album), \
+             patch.object(worker, "send_album_message", new=failing_send), \
+             patch.object(worker, "album_deliveries_total", _MetricProbe()), \
+             patch.object(worker, "delivery_attempts_total", _MetricProbe()), \
+             patch.object(worker, "delivery_failures_total", _MetricProbe()), \
+             patch.object(worker, "delivery_duration_seconds", _MetricProbe()):
+            with self.assertRaisesRegex(RuntimeError, "telegram send failed"):
+                asyncio.run(worker._execute_delivery_job(bot=SimpleNamespace(), cfg=cfg, job=job))
+
+        delete_delivery_history.assert_called_once_with(user_id=7, cycle_number=1, album_id="album-1")
+
+
+class JobFailureHandlingTests(unittest.TestCase):
+    def test_auth_failures_are_marked_non_retryable(self) -> None:
+        cfg = SimpleNamespace(
+            worker_id="worker-1",
+            claim_batch_size=10,
+            retry_backoff_base_seconds=30,
+            retry_backoff_max_seconds=1800,
+        )
+        job = {
+            "id": "8eaf4f97-3292-4dde-b79b-cf9493feebce",
+            "user_id": 7,
+            "job_type": worker.JOB_TYPE_SYNC_LIBRARY,
+            "attempt": 0,
+            "payload": {"user_provider_account_id": 55, "provider": "spotify"},
+        }
+
+        with patch.object(worker, "claim_runnable_jobs", return_value=[job]), \
+             patch.object(worker, "_execute_sync_job", side_effect=RuntimeError("401 unauthorized")), \
+             patch.object(worker, "is_auth_error", return_value=True), \
+             patch.object(worker, "mark_job_failed", return_value={"status": "dead", "attempt": 1, "run_at": None}) as mark_job_failed, \
+             patch.object(worker, "log_event"):
+            processed = asyncio.run(worker.process_claimed_jobs(bot=SimpleNamespace(), cfg=cfg))
+
+        self.assertEqual(processed, 1)
+        self.assertFalse(mark_job_failed.call_args.kwargs["retryable"])
 
 
 if __name__ == "__main__":

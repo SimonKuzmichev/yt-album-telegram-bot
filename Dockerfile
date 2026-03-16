@@ -8,5 +8,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
-
+COPY alembic.ini .
+COPY bot.py .
+COPY worker.py .
+COPY migrations ./migrations
+COPY src ./src

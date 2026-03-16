@@ -27,6 +27,7 @@ from bot import (  # noqa: E402
     cmd_connect_spotify,
     cmd_disconnect_spotify,
     cmd_help,
+    cmd_provider,
     cmd_reconnect_spotify,
     cmd_status,
     enforce_command_lock,
@@ -45,6 +46,7 @@ from bot import (  # noqa: E402
     get_request_id,
     handle_spotify_callback,
     parse_time_hhmm,
+    register_user_from_update,
     resolve_app_timezone,
 )
 
@@ -153,12 +155,12 @@ class HealthcheckServerTests(unittest.TestCase):
         session = {
             "id": 7,
             "user_id": 123,
-            "status": "pending",
+            "status": "processing",
             "requested_chat_id": 999,
             "expires_at": datetime(2026, 3, 15, 12, 30, tzinfo=timezone.utc),
         }
 
-        with patch("bot.get_oauth_session_by_state", return_value=session), \
+        with patch("bot.claim_oauth_session_by_state", return_value=session), \
              patch("bot.exchange_spotify_code_for_tokens", return_value={
                  "access_token": "secret-access-token",
                  "refresh_token": "secret-refresh-token",
@@ -175,7 +177,7 @@ class HealthcheckServerTests(unittest.TestCase):
                 now_utc=datetime(2026, 3, 15, 12, 0, tzinfo=timezone.utc),
             )
 
-        update_status.assert_called_once_with(7, "consumed", expected_current_status="pending")
+        update_status.assert_called_once_with(7, "consumed", expected_current_status="processing")
         upsert_account.assert_called_once()
         self.assertEqual(upsert_account.call_args.kwargs["provider"], "spotify")
         self.assertEqual(upsert_account.call_args.kwargs["status"], "connected")
@@ -198,7 +200,8 @@ class HealthcheckServerTests(unittest.TestCase):
             "expires_at": datetime(2026, 3, 15, 11, 30, tzinfo=timezone.utc),
         }
 
-        with patch("bot.get_oauth_session_by_state", return_value=session), \
+        with patch("bot.claim_oauth_session_by_state", return_value=None), \
+             patch("bot.get_oauth_session_by_state", return_value=session), \
              patch("bot.update_oauth_session_status", return_value={**session, "status": "expired"}) as update_status:
             html = handle_spotify_callback(
                 state="state-abc",
@@ -213,11 +216,11 @@ class HealthcheckServerTests(unittest.TestCase):
         session = {
             "id": 7,
             "user_id": 123,
-            "status": "pending",
+            "status": "processing",
             "expires_at": datetime(2026, 3, 15, 12, 30, tzinfo=timezone.utc),
         }
 
-        with patch("bot.get_oauth_session_by_state", return_value=session), \
+        with patch("bot.claim_oauth_session_by_state", return_value=session), \
              patch("bot._mark_spotify_oauth_failed") as mark_failed:
             html = handle_spotify_callback(
                 state="state-abc",
@@ -225,7 +228,7 @@ class HealthcheckServerTests(unittest.TestCase):
                 now_utc=datetime(2026, 3, 15, 12, 0, tzinfo=timezone.utc),
             )
 
-        mark_failed.assert_called_once_with(session_id=7, user_id=123)
+        mark_failed.assert_called_once_with(session_id=7, user_id=123, expected_current_status="processing")
         self.assertIn("Spotify callback incomplete", html)
 
     def test_handle_spotify_callback_returns_already_processed_for_consumed_session(self) -> None:
@@ -236,7 +239,8 @@ class HealthcheckServerTests(unittest.TestCase):
             "expires_at": datetime(2026, 3, 15, 12, 30, tzinfo=timezone.utc),
         }
 
-        with patch("bot.get_oauth_session_by_state", return_value=session), \
+        with patch("bot.claim_oauth_session_by_state", return_value=None), \
+             patch("bot.get_oauth_session_by_state", return_value=session), \
              patch("bot.exchange_spotify_code_for_tokens") as exchange_tokens:
             html = handle_spotify_callback(
                 state="state-abc",
@@ -251,11 +255,11 @@ class HealthcheckServerTests(unittest.TestCase):
         session = {
             "id": 7,
             "user_id": 123,
-            "status": "pending",
+            "status": "processing",
             "expires_at": datetime(2026, 3, 15, 12, 30, tzinfo=timezone.utc),
         }
 
-        with patch("bot.get_oauth_session_by_state", return_value=session), \
+        with patch("bot.claim_oauth_session_by_state", return_value=session), \
              patch("bot.exchange_spotify_code_for_tokens", side_effect=RuntimeError("boom")), \
              patch("bot._mark_spotify_oauth_failed") as mark_failed:
             html = handle_spotify_callback(
@@ -264,7 +268,7 @@ class HealthcheckServerTests(unittest.TestCase):
                 now_utc=datetime(2026, 3, 15, 12, 0, tzinfo=timezone.utc),
             )
 
-        mark_failed.assert_called_once_with(session_id=7, user_id=123)
+        mark_failed.assert_called_once_with(session_id=7, user_id=123, expected_current_status="processing")
         self.assertIn("Spotify connection failed", html)
 
 
@@ -590,6 +594,29 @@ class ConnectSpotifyTests(unittest.IsolatedAsyncioTestCase):
         reply_text = update.message.reply_text.await_args.kwargs["text"]
         self.assertIn("Spotify disconnected", reply_text)
 
+    async def test_cmd_provider_rejects_non_connected_account_activation(self) -> None:
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=99),
+            effective_user=SimpleNamespace(id=42),
+            callback_query=None,
+            message=SimpleNamespace(reply_text=AsyncMock()),
+        )
+        context = SimpleNamespace(application=SimpleNamespace(bot_data={}), args=["spotify"])
+        user = {"id": 123}
+        accounts = [
+            {"id": 55, "provider": "spotify", "status": "needs_reauth", "is_active": False},
+        ]
+
+        with patch("bot.require_allowlisted_user", AsyncMock(return_value=user)), \
+             patch("bot.list_user_provider_accounts", return_value=accounts), \
+             patch("bot.record_command"), \
+             patch("bot.set_active_user_provider_account") as set_active:
+            await cmd_provider(update, context)
+
+        set_active.assert_not_called()
+        reply_text = update.message.reply_text.await_args.kwargs["text"]
+        self.assertIn("cannot be activated right now", reply_text)
+
     async def test_cmd_help_lists_available_commands(self) -> None:
         update = SimpleNamespace(
             effective_chat=SimpleNamespace(id=99),
@@ -655,6 +682,25 @@ class StatusCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Token expires: 2099-03-15 13:00:00 UTC", reply_text)
         self.assertIn("Last auth: 2026-03-15 12:00:00 UTC", reply_text)
         self.assertIn("Last token refresh: 2026-03-15 12:10:00 UTC", reply_text)
+
+
+class UserRegistrationTests(unittest.TestCase):
+    def test_group_updates_do_not_overwrite_delivery_chat_id(self) -> None:
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=-1000, type="group"),
+            effective_user=SimpleNamespace(id=42, username="group-user"),
+        )
+
+        with patch("bot.upsert_user", return_value={"id": 123, "allowlisted": False, "status": "pending"}) as upsert_user, \
+             patch("bot.ensure_user_settings"):
+            register_user_from_update(update)
+
+        upsert_user.assert_called_once_with(
+            telegram_user_id=42,
+            telegram_chat_id=42,
+            username="group-user",
+            update_chat_id=False,
+        )
 
 
 class RateLimitTests(unittest.IsolatedAsyncioTestCase):

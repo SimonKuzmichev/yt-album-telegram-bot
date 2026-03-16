@@ -19,6 +19,7 @@ from src.db import (
     SYNC_RESULT_OK,
     SYNC_RESULT_TRANSIENT_ERROR,
     claim_runnable_jobs,
+    delete_delivery_history,
     enqueue_job_once,
     get_active_user_provider_account,
     get_latest_cycle_number,
@@ -159,6 +160,22 @@ def enqueue_due_jobs(cfg: WorkerConfig) -> int:
         timezone_name = str(user["timezone"])
         daily_time_local = user["daily_time_local"]
         chat_id = int(user["telegram_chat_id"])
+
+        if (
+            not user.get("active_provider")
+            or str(user.get("provider_status") or "") != PROVIDER_ACCOUNT_STATUS_CONNECTED
+        ):
+            log_event(
+                logger,
+                logging.INFO,
+                "daily_enqueue_skipped_no_provider",
+                user_id=user_id,
+                telegram_chat_id=chat_id,
+                worker_id=cfg.worker_id,
+                provider=user.get("active_provider"),
+                provider_status=user.get("provider_status"),
+            )
+            continue
 
         try:
             due, local_date_iso = _is_due_now(
@@ -490,6 +507,8 @@ async def _execute_delivery_job(bot: Bot, cfg: WorkerConfig, job: dict) -> None:
     provider = normalize_provider((account or {}).get("provider"))
     started = perf_counter()
     delivery_attempts_total.labels(provider=provider).inc()
+    reserved_album_id: str | None = None
+    reserved_cycle_number: int | None = None
 
     try:
         albums = _get_delivery_albums(cfg, user_id)
@@ -525,6 +544,9 @@ async def _execute_delivery_job(bot: Bot, cfg: WorkerConfig, job: dict) -> None:
             cycle_number=current_cycle_number,
             album_id=selected_album_id,
         )
+        if reserved:
+            reserved_album_id = selected_album_id
+            reserved_cycle_number = current_cycle_number
         if not reserved:
             remaining = [a for a in unsent if str(a.get("provider_album_id")) != selected_album_id]
             random.shuffle(remaining)
@@ -538,6 +560,8 @@ async def _execute_delivery_job(bot: Bot, cfg: WorkerConfig, job: dict) -> None:
                     album_id=candidate_id,
                 ):
                     selected_album = candidate
+                    reserved_album_id = candidate_id
+                    reserved_cycle_number = current_cycle_number
                     reserved = True
                     break
 
@@ -553,6 +577,23 @@ async def _execute_delivery_job(bot: Bot, cfg: WorkerConfig, job: dict) -> None:
         await send_album_message(bot, chat_id=chat_id, album=selected_album, prefix=prefix)
         album_deliveries_total.labels(provider=provider, status="success").inc()
     except Exception as exc:
+        if reserved_album_id is not None and reserved_cycle_number is not None:
+            try:
+                delete_delivery_history(
+                    user_id=user_id,
+                    cycle_number=reserved_cycle_number,
+                    album_id=reserved_album_id,
+                )
+            except Exception:
+                log_event(
+                    logger,
+                    logging.ERROR,
+                    "delivery_history_cleanup_failed",
+                    exc_info=True,
+                    user_id=user_id,
+                    telegram_chat_id=chat_id,
+                    provider=provider,
+                )
         album_deliveries_total.labels(provider=provider, status="failure").inc()
         error_type = "rate_limited" if is_rate_limited(exc) else classify_error(exc)
         if is_auth_error(exc):
@@ -689,13 +730,19 @@ async def process_claimed_jobs(bot: Bot, cfg: WorkerConfig) -> int:
                 sync_job_id=sync_job_id,
             )
         except Exception as exc:
+            retryable = not is_auth_error(exc)
             backoff_seconds = _compute_backoff_seconds(
                 attempt=attempt,
                 base=cfg.retry_backoff_base_seconds,
                 max_seconds=cfg.retry_backoff_max_seconds,
             )
             next_run_at = datetime.now(timezone.utc) + timedelta(seconds=backoff_seconds)
-            state = mark_job_failed(job_id=job_id, error_text=str(exc), next_run_at=next_run_at)
+            state = mark_job_failed(
+                job_id=job_id,
+                error_text=str(exc),
+                next_run_at=next_run_at,
+                retryable=retryable,
+            )
             log_event(
                 logger,
                 logging.ERROR,
