@@ -331,7 +331,7 @@ def enqueue_due_token_refresh_jobs(cfg: WorkerConfig) -> int:
         if row is None:
             log_event(
                 logger,
-                logging.INFO,
+                logging.DEBUG,
                 "provider_token_refresh_enqueue_skipped_idempotency",
                 job_type=JOB_TYPE_REFRESH_PROVIDER_TOKEN,
                 user_id=user_id,

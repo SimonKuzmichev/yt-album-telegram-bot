@@ -270,6 +270,25 @@ class TokenRefreshEnqueueTests(unittest.TestCase):
             "refresh-token:55:1773576300",
         )
 
+    def test_duplicate_refresh_enqueue_logs_at_debug(self) -> None:
+        cfg = SimpleNamespace(worker_id="worker-1")
+        account = {
+            "id": 55,
+            "user_id": 88,
+            "provider": "spotify",
+            "token_expires_at": datetime(2026, 3, 15, 12, 5, tzinfo=timezone.utc),
+        }
+
+        with patch.object(worker, "list_provider_accounts_needing_token_refresh", return_value=[account]), \
+             patch.object(worker, "enqueue_job_once", return_value=None), \
+             patch.object(worker, "log_event") as log_event:
+            enqueued = enqueue_due_token_refresh_jobs(cfg)
+
+        self.assertEqual(enqueued, 0)
+        _, level, event = log_event.call_args.args[:3]
+        self.assertEqual(level, worker.logging.DEBUG)
+        self.assertEqual(event, "provider_token_refresh_enqueue_skipped_idempotency")
+
     def test_daily_enqueue_skips_users_without_connected_provider(self) -> None:
         cfg = SimpleNamespace(worker_id="worker-1", due_window_seconds=60)
         users = [
